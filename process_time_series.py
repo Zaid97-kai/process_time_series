@@ -1,1087 +1,567 @@
 import pandas as pd
 import numpy as np
-from scipy import stats
-from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.cluster import KMeans
-from sklearn.impute import SimpleImputer
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
 import warnings
 warnings.filterwarnings('ignore')
 
-# Импорт для LSTM
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.regularizers import l2
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+# Загрузка данных
+df = pd.read_excel('Dataset.xlsx')
+print(f"Размер исходного датасета: {df.shape}")
+print(f"Колонки: {df.columns.tolist()}")
 
-# Импорт для визуализации
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.patches import Patch
+# Целевые переменные для прогнозирования
+target_columns = ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6']
 
-def calculate_time_series_features(segment, segment_id, segment_start_idx, target_columns):
+# 1. Разделение временного ряда на сегменты длиной 20 записей
+segment_length = 20
+num_segments = len(df) // segment_length
+segments = []
+
+for i in range(num_segments):
+    start_idx = i * segment_length
+    end_idx = (i + 1) * segment_length
+    segment = df.iloc[start_idx:end_idx].copy()
+    segments.append(segment)
+
+print(f"Создано {len(segments)} сегментов по {segment_length} записей каждый")
+
+# 2. Создание Excel файла с сегментами на разных листах
+with pd.ExcelWriter('segmented_time_series.xlsx') as writer:
+    for i, segment in enumerate(segments):
+        segment.to_excel(writer, sheet_name=f'Segment_{i+1}', index=False)
+
+# 3. Вычисление временных характеристик для каждого сегмента
+def calculate_temporal_features(segment_df, feature_columns=['F', 'F1', 'F6']):
     """
-    Вычисляет временные характеристики для сегмента временного ряда.
-    Теперь характеристики вычисляются отдельно для каждого выходного параметра.
+    Вычисляет временные характеристики для сегмента
     """
-    if len(segment) < 5:
-        return None
+    features = {}
     
-    features = {
-        'Сегмент_ID': segment_id,
-        'Начальный_индекс': segment_start_idx,
-        'Длина_сегмента': len(segment),
-    }
-    
-    # Для каждого выходного параметра вычисляем характеристики
-    for target_col in target_columns:
-        time_series = segment[target_col].values
-        
-        # Проверяем на NaN
-        if np.isnan(time_series).any():
-            # Заменяем NaN на среднее значение
-            time_series = np.nan_to_num(time_series, nan=np.nanmean(time_series))
-        
-        # Базовые статистики
-        features[f'{target_col}_Минимум'] = np.min(time_series)
-        features[f'{target_col}_Максимум'] = np.max(time_series)
-        features[f'{target_col}_Среднее'] = np.mean(time_series)
-        features[f'{target_col}_Медиана'] = np.median(time_series)
-        features[f'{target_col}_Дисперсия'] = np.var(time_series)
-        features[f'{target_col}_Стандартное_отклонение'] = np.std(time_series)
-        features[f'{target_col}_Размах'] = np.max(time_series) - np.min(time_series)
-        
-        # Коэффициенты асимметрии и эксцесса
-        if len(time_series) > 2 and np.std(time_series) > 0:
-            features[f'{target_col}_Коэффициент_асимметрии'] = stats.skew(time_series)
-        else:
-            features[f'{target_col}_Коэффициент_асимметрии'] = 0
+    for col in feature_columns:
+        if col in segment_df.columns:
+            data = segment_df[col].values
             
-        if len(time_series) > 3 and np.std(time_series) > 0:
-            features[f'{target_col}_Коэффициент_эксцесса'] = stats.kurtosis(time_series)
-        else:
-            features[f'{target_col}_Коэффициент_эксцесса'] = 0
-        
-        # Автокорреляция (лаг 1)
-        if len(time_series) > 1 and np.std(time_series) > 0:
-            autocorr = pd.Series(time_series).autocorr(lag=1)
-            features[f'{target_col}_Автокорреляция_лаг1'] = autocorr if not np.isnan(autocorr) else 0
-        else:
-            features[f'{target_col}_Автокорреляция_лаг1'] = 0
-        
-        # Площадь под графиком
-        features[f'{target_col}_Площадь_под_графиком'] = np.trapz(time_series)
-        
-        # Наклон тренда
-        x = np.arange(len(time_series))
-        if len(time_series) > 1 and np.var(time_series) > 0:
-            try:
-                slope, intercept, r_value, p_value, std_err = stats.linregress(x, time_series)
-                features[f'{target_col}_Наклон_тренда'] = slope
-                features[f'{target_col}_R_квадрат_тренда'] = r_value**2
-            except:
-                features[f'{target_col}_Наклон_тренда'] = 0
-                features[f'{target_col}_R_квадрат_тренда'] = 0
-        else:
-            features[f'{target_col}_Наклон_тренда'] = 0
-            features[f'{target_col}_R_квадрат_тренда'] = 0
-        
-        # Квартили и IQR
-        if len(time_series) >= 4:
-            q1 = np.percentile(time_series, 25)
-            q3 = np.percentile(time_series, 75)
-            features[f'{target_col}_Q1'] = q1
-            features[f'{target_col}_Q3'] = q3
-            features[f'{target_col}_IQR'] = q3 - q1
-        else:
-            features[f'{target_col}_Q1'] = 0
-            features[f'{target_col}_Q3'] = 0
-            features[f'{target_col}_IQR'] = 0
-        
-        # Количество пиков
-        try:
-            peaks, _ = find_peaks(time_series)
-            features[f'{target_col}_Количество_пиков'] = len(peaks)
-        except:
-            features[f'{target_col}_Количество_пиков'] = 0
-        
-        # Коэффициент вариации
-        if np.mean(time_series) != 0 and np.std(time_series) > 0:
-            features[f'{target_col}_Коэффициент_вариации'] = np.std(time_series) / np.mean(time_series)
-        else:
-            features[f'{target_col}_Коэффициент_вариации'] = 0
-        
-        # Среднеквадратичное значение
-        features[f'{target_col}_Среднеквадратичное'] = np.sqrt(np.mean(time_series**2))
+            # Базовые статистики для каждой колонки
+            prefix = f"{col}_"
+            features[prefix + 'min'] = np.min(data)
+            features[prefix + 'max'] = np.max(data)
+            features[prefix + 'mean'] = np.mean(data)
+            features[prefix + 'median'] = np.median(data)
+            features[prefix + 'variance'] = np.var(data)
+            features[prefix + 'skewness'] = pd.Series(data).skew()
+            features[prefix + 'kurtosis'] = pd.Series(data).kurtosis()
+            features[prefix + 'autocorr'] = pd.Series(data).autocorr()
+            features[prefix + 'area'] = np.trapz(data)
+            features[prefix + 'trend'] = np.polyfit(range(len(data)), data, 1)[0]
     
     return features
 
-def perform_kmeans_clustering(features_df, n_clusters=3):
-    """
-    Выполняет кластеризацию KMeans с обработкой NaN значений.
-    """
-    print("\n" + "=" * 60)
-    print("КЛАСТЕРИЗАЦИЯ K-MEANS")
-    print("=" * 60)
-    
-    # Выбираем только числовые характеристики для кластеризации
-    numeric_cols = features_df.select_dtypes(include=[np.number]).columns
-    # Исключаем идентификаторы и индексы
-    exclude_cols = ['Начальный_индекс', 'Длина_сегмента']
-    cluster_cols = [col for col in numeric_cols if col not in exclude_cols]
-    
-    X = features_df[cluster_cols].values
-    
-    print(f"Размерность данных для кластеризации: {X.shape}")
-    print(f"Используемые характеристики: {len(cluster_cols)}")
-    
-    # Проверяем на NaN
-    nan_count = np.isnan(X).sum()
-    if nan_count > 0:
-        print(f"Обнаружено NaN значений: {nan_count}")
-        print("Заполняем NaN средними значениями...")
-        
-        # Заполняем NaN средними значениями по колонкам
-        imputer = SimpleImputer(strategy='mean')
-        X = imputer.fit_transform(X)
-    
-    # Нормализация данных (StandardScaler)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Автоматический выбор количества кластеров с помощью метода локтя
-    if n_clusters == 'auto':
-        print("\nОпределение оптимального количества кластеров (метод локтя)...")
-        inertias = []
-        max_clusters = min(10, len(X_scaled))
-        
-        for k in range(1, max_clusters + 1):
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            kmeans.fit(X_scaled)
-            inertias.append(kmeans.inertia_)
-        
-        # Находим "локоть" - точку, где уменьшение инерции замедляется
-        diffs = np.diff(inertias)
-        diff_diffs = np.diff(diffs)
-        if len(diff_diffs) > 0:
-            n_clusters = np.argmax(diff_diffs) + 2
-        else:
-            n_clusters = 3
-        
-        print(f"Оптимальное количество кластеров: {n_clusters}")
-    
-    # Применение KMeans
-    print(f"\nВыполнение кластеризации KMeans с {n_clusters} кластерами...")
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(X_scaled)
-    
-    # Добавляем метки кластеров в DataFrame
-    features_df['Кластер'] = cluster_labels
-    
-    # Статистика по кластерам
-    print(f"\nРезультаты кластеризации:")
-    print(f"Количество кластеров: {n_clusters}")
-    print(f"Количество точек в каждом кластере:")
-    
-    for cluster_id in sorted(set(cluster_labels)):
-        count = list(cluster_labels).count(cluster_id)
-        print(f"  Кластер {cluster_id}: {count} сегментов ({count/len(cluster_labels)*100:.1f}%)")
-    
-    # Вычисляем инерцию (сумма квадратов расстояний до центроидов)
-    inertia = kmeans.inertia_
-    print(f"\nИнерция (within-cluster sum of squares): {inertia:.2f}")
-    
-    return features_df, cluster_labels, scaler, cluster_cols, kmeans
+# Создание DataFrame с характеристиками
+features_list = []
+feature_columns_for_stats = ['F', 'F1', 'F6']
 
-def prepare_cross_segment_data(train_segment, test_segment, input_columns, output_columns, sequence_length=10):
-    """
-    Подготавливает данные для обучения на одном сегменте и тестирования на другом.
-    """
-    # Проверяем на NaN
-    train_data = train_segment.fillna(train_segment.mean())
-    test_data = test_segment.fillna(test_segment.mean())
-    
-    # Разделяем входные и выходные данные для обучения
-    X_train_data = train_data[input_columns].values
-    y_train_data = train_data[output_columns].values
-    
-    # Разделяем входные и выходные данные для тестирования
-    X_test_data = test_data[input_columns].values
-    y_test_data = test_data[output_columns].values
-    
-    # Нормализация данных (отдельно для обучения и тестирования для реалистичности)
-    X_scaler = MinMaxScaler(feature_range=(0, 1))
-    y_scaler = MinMaxScaler(feature_range=(0, 1))
-    
-    X_train_scaled = X_scaler.fit_transform(X_train_data)
-    y_train_scaled = y_scaler.fit_transform(y_train_data)
-    
-    # Для тестовых данных используем те же скейлеры
-    X_test_scaled = X_scaler.transform(X_test_data)
-    y_test_scaled = y_scaler.transform(y_test_data)
-    
-    # Создание последовательностей для обучения
-    X_train_seq, y_train_seq = [], []
-    for i in range(len(X_train_scaled) - sequence_length):
-        X_train_seq.append(X_train_scaled[i:i+sequence_length])
-        y_train_seq.append(y_train_scaled[i+sequence_length])
-    
-    # Создание последовательностей для тестирования
-    X_test_seq, y_test_seq = [], []
-    for i in range(len(X_test_scaled) - sequence_length):
-        X_test_seq.append(X_test_scaled[i:i+sequence_length])
-        y_test_seq.append(y_test_scaled[i+sequence_length])
-    
-    if len(X_train_seq) == 0 or len(X_test_seq) == 0:
-        return None, None, None, None, None, None
-    
-    X_train_seq = np.array(X_train_seq)
-    y_train_seq = np.array(y_train_seq)
-    X_test_seq = np.array(X_test_seq)
-    y_test_seq = np.array(y_test_seq)
-    
-    return X_train_seq, X_test_seq, y_train_seq, y_test_seq, X_scaler, y_scaler
+for i, segment in enumerate(segments):
+    features = calculate_temporal_features(segment, feature_columns_for_stats)
+    features['segment_id'] = i + 1
+    features_list.append(features)
 
-def build_improved_lstm_model(input_shape, output_dim, units=64, dropout_rate=0.3, l2_reg=0.001):
+features_df = pd.DataFrame(features_list)
+id_col = ['segment_id']
+other_cols = [col for col in features_df.columns if col != 'segment_id']
+features_df = features_df[id_col + other_cols]
+
+# Сохранение характеристик в Excel
+features_df.to_excel('temporal_features.xlsx', index=False)
+print(f"Временные характеристики сохранены в 'temporal_features.xlsx'")
+
+# 4. Кластеризация с использованием KMeans
+X = features_df.drop('segment_id', axis=1).values
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Определение оптимального числа кластеров
+inertia = []
+K_range = range(1, min(11, len(X_scaled)))
+for k in K_range:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    kmeans.fit(X_scaled)
+    inertia.append(kmeans.inertia_)
+
+# Построение графика метода локтя
+plt.figure(figsize=(10, 6))
+plt.plot(K_range, inertia, 'bo-')
+plt.xlabel('Number of clusters (k)')
+plt.ylabel('Inertia')
+plt.title('Elbow Method for Optimal k')
+plt.grid(True)
+plt.savefig('elbow_method.png', dpi=300, bbox_inches='tight')
+plt.close()
+
+# Автоматическое определение оптимального k
+inertia_diff = np.diff(inertia)
+if len(inertia_diff) > 1:
+    inertia_diff_ratio = inertia_diff[1:] / inertia_diff[:-1]
+    optimal_k = np.argmin(inertia_diff_ratio) + 2
+else:
+    optimal_k = 3
+optimal_k = max(2, min(optimal_k, 5))
+
+print(f"Используется {optimal_k} кластеров для KMeans")
+
+# Кластеризация
+kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+cluster_labels = kmeans.fit_predict(X_scaled)
+features_df['cluster'] = cluster_labels
+features_df.to_excel('temporal_features_with_clusters.xlsx', index=False)
+
+print("\nРаспределение сегментов по кластерам:")
+print(features_df['cluster'].value_counts().sort_index())
+
+# 5. Подготовка данных для LSTM (многомерный прогноз)
+def prepare_multivariate_lstm_data(segment_df, feature_columns, target_columns, sequence_length=10):
     """
-    Строит улучшенную многомерную модель LSTM для повышения точности.
+    Подготавливает многомерные данные для обучения LSTM
     """
+    X_data = segment_df[feature_columns].values
+    y_data = segment_df[target_columns].values
+    
+    X, y = [], []
+    
+    for i in range(len(X_data) - sequence_length):
+        X.append(X_data[i:i+sequence_length])
+        y.append(y_data[i+sequence_length])
+    
+    if len(X) == 0:
+        return np.array([]), np.array([]), [], []
+    
+    X = np.array(X)
+    y = np.array(y)
+    
+    # Нормализация данных
+    X_scalers = []
+    y_scalers = []
+    
+    # Нормализация признаков
+    X_scaled = np.zeros_like(X)
+    for feature_idx in range(X.shape[2]):
+        feature_scaler = MinMaxScaler()
+        feature_data = X[:, :, feature_idx].reshape(-1, 1)
+        feature_scaled = feature_scaler.fit_transform(feature_data).reshape(X.shape[0], X.shape[1])
+        X_scaled[:, :, feature_idx] = feature_scaled
+        X_scalers.append(feature_scaler)
+    
+    # Нормализация целевых переменных
+    y_scaled = np.zeros_like(y)
+    for target_idx in range(y.shape[1]):
+        target_scaler = MinMaxScaler()
+        target_data = y[:, target_idx].reshape(-1, 1)
+        target_scaled = target_scaler.fit_transform(target_data).flatten()
+        y_scaled[:, target_idx] = target_scaled
+        y_scalers.append(target_scaler)
+    
+    return X_scaled, y_scaled, X_scalers, y_scalers
+
+# 6. Создание и обучение LSTM моделей для каждого кластера
+lstm_models = {}
+lstm_scalers_X = {}
+lstm_scalers_y = {}
+
+# Выбираем признаки для LSTM (упрощенный набор)
+lstm_feature_columns = ['e1', 'e6', 'F', 'F1', 'F6']
+
+for cluster_id in range(optimal_k):
+    print(f"\n--- Обучение LSTM для кластера {cluster_id} ---")
+    
+    # Получаем индексы сегментов в текущем кластере
+    cluster_segment_ids = features_df[features_df['cluster'] == cluster_id]['segment_id'].values
+    cluster_segment_ids = [int(id) - 1 for id in cluster_segment_ids]
+    
+    if len(cluster_segment_ids) == 0:
+        print(f"Кластер {cluster_id} пустой, пропускаем")
+        continue
+    
+    # Собираем все данные из сегментов кластера
+    X_all, y_all = [], []
+    X_scalers_list, y_scalers_list = [], []
+    
+    for seg_id in cluster_segment_ids:
+        if seg_id < len(segments):
+            segment = segments[seg_id]
+            X_seg, y_seg, X_scalers, y_scalers = prepare_multivariate_lstm_data(
+                segment, 
+                lstm_feature_columns,
+                target_columns
+            )
+            
+            if len(X_seg) > 0:
+                X_all.append(X_seg)
+                y_all.append(y_seg)
+                X_scalers_list.append(X_scalers)
+                y_scalers_list.append(y_scalers)
+    
+    if len(X_all) == 0:
+        print(f"Нет данных для обучения кластера {cluster_id}")
+        continue
+    
+    # Объединяем данные
+    X_all = np.vstack(X_all)
+    y_all = np.vstack(y_all)
+    
+    print(f"Размер данных для обучения: X={X_all.shape}, y={y_all.shape}")
+    
+    # Создание модели LSTM
     model = Sequential([
-        Input(shape=input_shape),
-        LSTM(units, return_sequences=True, kernel_regularizer=l2(l2_reg), 
-             recurrent_regularizer=l2(l2_reg)),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        LSTM(units//2, return_sequences=True, kernel_regularizer=l2(l2_reg),
-             recurrent_regularizer=l2(l2_reg)),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        LSTM(units//4, return_sequences=False, kernel_regularizer=l2(l2_reg),
-             recurrent_regularizer=l2(l2_reg)),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        Dense(64, activation='relu', kernel_regularizer=l2(l2_reg)),
-        BatchNormalization(),
-        Dropout(dropout_rate/2),
-        
-        Dense(32, activation='relu', kernel_regularizer=l2(l2_reg)),
-        BatchNormalization(),
-        
-        Dense(output_dim)
+        LSTM(64, activation='relu', return_sequences=True, input_shape=(X_all.shape[1], X_all.shape[2])),
+        Dropout(0.2),
+        LSTM(64, activation='relu'),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(len(target_columns))
     ])
     
-    # Используем адаптивный learning rate
-    optimizer = Adam(learning_rate=0.001, clipvalue=1.0)
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
     
-    model.compile(
-        optimizer=optimizer,
-        loss='mse',
-        metrics=['mae', 'mse']
-    )
-    
-    return model
-
-def train_and_test_cross_segment(cluster_data, cluster_id, input_columns, output_columns, 
-                                sequence_length=10, epochs=100):
-    """
-    Обучает улучшенную модель на одном сегменте и тестирует на другом в том же кластере.
-    """
-    print(f"\n{'='*60}")
-    print(f"КЛАСТЕР {cluster_id}: ОБУЧЕНИЕ И ТЕСТИРОВАНИЕ")
-    print(f"{'='*60}")
-    
-    segment_ids = list(cluster_data.keys())
-    
-    if len(segment_ids) < 2:
-        print(f"❌ В кластере {cluster_id} недостаточно сегментов для кросс-сегментного обучения (требуется минимум 2)")
-        return None, None, None, None
-    
-    # Выбираем сегменты для обучения и тестирования
-    train_seg_id = segment_ids[0]
-    test_seg_id = segment_ids[1]
-    
-    print(f"🎯 СТРАТЕГИЯ:")
-    print(f"   Обучение на сегменте: {train_seg_id}")
-    print(f"   Тестирование на сегменте: {test_seg_id}")
-    
-    train_segment = cluster_data[train_seg_id]
-    test_segment = cluster_data[test_seg_id]
-    
-    # Подготовка данных
-    prepared_data = prepare_cross_segment_data(
-        train_segment, test_segment, input_columns, output_columns, sequence_length
-    )
-    
-    if prepared_data[0] is None:
-        print(f"❌ Не удалось подготовить данные для обучения и тестирования")
-        return None, None, None, None
-    
-    X_train, X_test, y_train, y_test, X_scaler, y_scaler = prepared_data
-    
-    if len(X_train) < 1:
-        print(f"❌ Недостаточно данных для обучения")
-        return None, None, None, None
-    
-    if len(X_test) < 1:
-        print(f"❌ Недостаточно данных для тестирования")
-        return None, None, None, None
-    
-    print(f"📊 ДАННЫЕ:")
-    print(f"   Размер обучающей выборки: {len(X_train)} последовательностей")
-    print(f"   Размер тестовой выборки: {len(X_test)} последовательностей")
-    
-    # Построение улучшенной модели
-    model = build_improved_lstm_model(
-        input_shape=(sequence_length, len(input_columns)),
-        output_dim=len(output_columns)
-    )
-    
-    # Callbacks для улучшения обучения
-    early_stopping = EarlyStopping(
-        monitor='val_loss',
-        patience=15,
-        restore_best_weights=True,
-        min_delta=0.0001,
-        verbose=0
-    )
-    
-    reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=5,
-        min_lr=0.00001,
-        verbose=0
-    )
-    
-    print("🏋️ НАЧИНАЕМ ОБУЧЕНИЕ МОДЕЛИ...")
+    # Обучение модели
     history = model.fit(
-        X_train, y_train,
+        X_all, y_all,
+        epochs=100,
+        batch_size=16,
         validation_split=0.2,
-        epochs=epochs,
-        batch_size=32,
-        callbacks=[early_stopping, reduce_lr],
         verbose=0
     )
     
-    # Проверяем, была ли остановка обучения
-    if len(history.history['loss']) < epochs:
-        print(f"   Обучение остановлено на эпохе {len(history.history['loss'])} (ранняя остановка)")
+    # Сохранение модели
+    model.save(f'lstm_model_cluster_{cluster_id}.keras')
+    lstm_models[cluster_id] = model
     
-    # Прогнозирование на тестовых данных
-    print("🔮 ВЫПОЛНЯЕМ ПРОГНОЗИРОВАНИЕ...")
-    y_pred_scaled = model.predict(X_test, verbose=0)
-    y_pred = y_scaler.inverse_transform(y_pred_scaled)
-    y_test_original = y_scaler.inverse_transform(y_test)
+    # Сохраняем скалеры из первого сегмента
+    if X_scalers_list:
+        lstm_scalers_X[cluster_id] = X_scalers_list[0]
+        lstm_scalers_y[cluster_id] = y_scalers_list[0]
     
-    # Расчет метрик для каждого выходного параметра
-    metrics = {
-        'Кластер': cluster_id,
-        'Сегмент_обучения': train_seg_id,
-        'Сегмент_тестирования': test_seg_id,
-        'Длина_обучающей_выборки': len(X_train),
-        'Длина_тестовой_выборки': len(X_test),
-        'Эпохи_обучения': len(history.history['loss'])
-    }
-    
-    param_metrics = {}
-    for i, output_col in enumerate(output_columns):
-        mse = mean_squared_error(y_test_original[:, i], y_pred[:, i])
-        mae = mean_absolute_error(y_test_original[:, i], y_pred[:, i])
-        rmse = np.sqrt(mse)
-        r2 = r2_score(y_test_original[:, i], y_pred[:, i])
-        
-        param_metrics[f'{output_col}_MSE'] = mse
-        param_metrics[f'{output_col}_RMSE'] = rmse
-        param_metrics[f'{output_col}_MAE'] = mae
-        param_metrics[f'{output_col}_R2'] = r2
-    
-    # Средние метрики по всем параметрам
-    metrics['Средний_MSE'] = np.mean([param_metrics[f'{col}_MSE'] for col in output_columns])
-    metrics['Средний_RMSE'] = np.mean([param_metrics[f'{col}_RMSE'] for col in output_columns])
-    metrics['Средний_MAE'] = np.mean([param_metrics[f'{col}_MAE'] for col in output_columns])
-    metrics['Средний_R2'] = np.mean([param_metrics[f'{col}_R2'] for col in output_columns])
-    
-    # Объединяем все метрики
-    all_metrics = {**metrics, **param_metrics}
-    
-    print(f"✅ ОБУЧЕНИЕ ЗАВЕРШЕНО:")
-    print(f"   Средний R² = {metrics['Средний_R2']:.4f}")
-    print(f"   Средний MSE = {metrics['Средний_MSE']:.8f}")
-    print(f"   Средний MAE = {metrics['Средний_MAE']:.8f}")
-    
-    return {
-        'y_test': y_test_original,
-        'y_pred': y_pred,
-        'history': history.history,
-        'model': model,
-        'train_segment': train_seg_id,
-        'test_segment': test_seg_id,
-        'X_scaler': X_scaler,
-        'y_scaler': y_scaler
-    }, all_metrics, train_seg_id, test_seg_id
-
-def create_detailed_prediction_plots(cluster_id, predictions, metrics, output_columns, train_seg_id, test_seg_id):
-    """
-    Создает детальные графики сравнения прогнозов и истинных значений.
-    """
-    import os
-    cluster_dir = f"cluster_{cluster_id}_results"
-    os.makedirs(cluster_dir, exist_ok=True)
-    
-    y_test = predictions['y_test']
-    y_pred = predictions['y_pred']
-    
-    # 1. Графики для каждого параметра отдельно
-    for i, output_col in enumerate(output_columns):
-        plt.figure(figsize=(14, 8))
-        
-        # Основной график сравнения
-        plt.subplot(2, 2, 1)
-        time_steps = range(len(y_test[:, i]))
-        
-        plt.plot(time_steps, y_test[:, i], 'b-', linewidth=2, alpha=0.7, label='Истинные значения')
-        plt.plot(time_steps, y_pred[:, i], 'r--', linewidth=2, alpha=0.7, label='Прогнозы')
-        plt.fill_between(time_steps, y_test[:, i], y_pred[:, i], alpha=0.2, color='gray', label='Ошибка')
-        
-        plt.title(f'{output_col}\nКластер {cluster_id}', fontsize=14, fontweight='bold')
-        plt.xlabel('Временной шаг', fontsize=12)
-        plt.ylabel('Значение', fontsize=12)
-        plt.legend(fontsize=10)
-        plt.grid(True, alpha=0.3)
-        
-        # График ошибок
-        plt.subplot(2, 2, 2)
-        errors = y_test[:, i] - y_pred[:, i]
-        
-        plt.plot(time_steps, errors, 'g-', linewidth=1.5, alpha=0.7)
-        plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        plt.fill_between(time_steps, errors, 0, alpha=0.2, color='green')
-        
-        plt.title(f'Ошибки прогнозирования\nMSE={metrics[f"{output_col}_MSE"]:.6f}, MAE={metrics[f"{output_col}_MAE"]:.6f}', 
-                 fontsize=12)
-        plt.xlabel('Временной шаг', fontsize=10)
-        plt.ylabel('Ошибка', fontsize=10)
-        plt.grid(True, alpha=0.3)
-        
-        # Гистограмма ошибок
-        plt.subplot(2, 2, 3)
-        plt.hist(errors, bins=30, edgecolor='black', alpha=0.7, color='skyblue')
-        plt.axvline(x=0, color='r', linestyle='--', linewidth=2)
-        plt.title('Распределение ошибок', fontsize=12)
-        plt.xlabel('Ошибка', fontsize=10)
-        plt.ylabel('Частота', fontsize=10)
-        plt.grid(True, alpha=0.3, axis='y')
-        
-        # Диаграмма рассеяния
-        plt.subplot(2, 2, 4)
-        plt.scatter(y_test[:, i], y_pred[:, i], alpha=0.6, s=30)
-        
-        # Линия идеального прогноза
-        min_val = min(y_test[:, i].min(), y_pred[:, i].min())
-        max_val = max(y_test[:, i].max(), y_pred[:, i].max())
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, alpha=0.7)
-        
-        plt.title(f'Диаграмма рассеяния\nR²={metrics[f"{output_col}_R2"]:.4f}', fontsize=12)
-        plt.xlabel('Истинные значения', fontsize=10)
-        plt.ylabel('Прогнозы', fontsize=10)
-        plt.grid(True, alpha=0.3)
-        
-        plt.suptitle(f'Детальный анализ прогнозов: {output_col}\n'
-                    f'Обучение на сегменте: {train_seg_id}, Тестирование на сегменте: {test_seg_id}', 
-                    fontsize=16, fontweight='bold', y=1.02)
-        plt.tight_layout()
-        plt.savefig(f"{cluster_dir}/detailed_prediction_{output_col}_cluster_{cluster_id}.png", 
-                   dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    # 2. Сводный график всех параметров
-    plt.figure(figsize=(16, 10))
-    
-    n_params = len(output_columns)
-    n_cols = 3
-    n_rows = (n_params + n_cols - 1) // n_cols
-    
-    for i, output_col in enumerate(output_columns):
-        plt.subplot(n_rows, n_cols, i + 1)
-        
-        time_steps = range(len(y_test[:, i]))
-        
-        plt.plot(time_steps, y_test[:, i], 'b-', linewidth=1.5, alpha=0.7, label='Истинные')
-        plt.plot(time_steps, y_pred[:, i], 'r--', linewidth=1.5, alpha=0.7, label='Прогнозы')
-        
-        plt.title(f'{output_col}\nR²={metrics[f"{output_col}_R2"]:.4f}', fontsize=11)
-        plt.xlabel('Временной шаг', fontsize=9)
-        plt.ylabel('Значение', fontsize=9)
-        plt.legend(fontsize=8)
-        plt.grid(True, alpha=0.3)
-    
-    plt.suptitle(f'СВОДКА ПРОГНОЗОВ ПО ВСЕМ ПАРАМЕТРАМ - КЛАСТЕР {cluster_id}\n'
-                f'Обучение на сегменте: {train_seg_id} | Тестирование на сегменте: {test_seg_id}', 
-                fontsize=18, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig(f"{cluster_dir}/summary_predictions_cluster_{cluster_id}.png", 
-               dpi=150, bbox_inches='tight')
+    # Построение графиков обучения - РАЗДЕЛЬНЫЕ ГРАФИКИ
+    # График потерь
+    plt.figure(figsize=(10, 6))
+    plt.plot(history.history['loss'], label='Training Loss')
+    if 'val_loss' in history.history:
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title(f'Model Loss - Cluster {cluster_id}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'loss_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    # 3. График обучения
-    plt.figure(figsize=(12, 8))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(predictions['history']['loss'], 'b-', label='Ошибка обучения', linewidth=2)
-    plt.plot(predictions['history']['val_loss'], 'r-', label='Ошибка валидации', linewidth=2)
-    plt.title('Кривая обучения', fontsize=14, fontweight='bold')
-    plt.xlabel('Эпоха', fontsize=12)
-    plt.ylabel('Ошибка (MSE)', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3)
-    plt.yscale('log')
-    
-    plt.subplot(2, 1, 2)
-    plt.plot(predictions['history']['mae'], 'g-', label='MAE обучения', linewidth=2)
-    plt.plot([m for m in predictions['history']['val_mae'] if not np.isnan(m)], 'orange', 
-             label='MAE валидации', linewidth=2)
-    plt.title('Средняя абсолютная ошибка', fontsize=14, fontweight='bold')
-    plt.xlabel('Эпоха', fontsize=12)
-    plt.ylabel('MAE', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, alpha=0.3)
-    
-    plt.suptitle(f'ПРОЦЕСС ОБУЧЕНИЯ - КЛАСТЕР {cluster_id}\n'
-                f'Средний R² = {metrics["Средний_R2"]:.4f}', 
-                fontsize=16, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig(f"{cluster_dir}/training_history_cluster_{cluster_id}.png", 
-               dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Созданы детальные графики для кластера {cluster_id}")
-
-def save_cross_segment_results(cluster_id, predictions, metrics, features_df, output_columns, 
-                              train_seg_id, test_seg_id):
-    """
-    Сохраняет результаты кросс-сегментного обучения и тестирования.
-    """
-    import os
-    cluster_dir = f"cluster_{cluster_id}_results"
-    os.makedirs(cluster_dir, exist_ok=True)
-    
-    # 1. Сохраняем метрики в Excel
-    metrics_df = pd.DataFrame([metrics])
-    metrics_df.to_excel(f"{cluster_dir}/cross_segment_metrics_cluster_{cluster_id}.xlsx", index=False)
-    
-    # 2. Сохраняем прогнозы в Excel
-    if predictions:
-        with pd.ExcelWriter(f"{cluster_dir}/cross_segment_predictions_cluster_{cluster_id}.xlsx") as writer:
-            # Создаем DataFrame с прогнозами для всех выходных параметров
-            pred_dfs = []
-            for i, col in enumerate(output_columns):
-                temp_df = pd.DataFrame({
-                    f'{col}_Фактические': predictions['y_test'][:, i],
-                    f'{col}_Прогнозные': predictions['y_pred'][:, i],
-                    f'{col}_Ошибка': predictions['y_test'][:, i] - predictions['y_pred'][:, i],
-                    f'{col}_Абсолютная_ошибка': np.abs(predictions['y_test'][:, i] - predictions['y_pred'][:, i]),
-                    f'{col}_Относительная_ошибка_%': 100 * np.abs(predictions['y_test'][:, i] - predictions['y_pred'][:, i]) / 
-                                                  np.abs(predictions['y_test'][:, i] + 1e-10)
-                })
-                pred_dfs.append(temp_df)
-            
-            # Объединяем все прогнозы в один DataFrame
-            pred_df = pd.concat(pred_dfs, axis=1)
-            pred_df.to_excel(writer, sheet_name="predictions", index=False)
-            
-            # Добавляем информацию о сегментах
-            seg_info = pd.DataFrame({
-                'Параметр': ['Кластер', 'Сегмент обучения', 'Сегмент тестирования', 
-                           'Размер обучающей выборки', 'Размер тестовой выборки',
-                           'Эпохи обучения', 'Средний R²', 'Средний MSE'],
-                'Значение': [cluster_id, train_seg_id, test_seg_id,
-                           metrics['Длина_обучающей_выборки'], metrics['Длина_тестовой_выборки'],
-                           metrics['Эпохи_обучения'], metrics['Средний_R2'], metrics['Средний_MSE']]
-            })
-            seg_info.to_excel(writer, sheet_name="segment_info", index=False)
-    
-    # 3. Сохраняем информацию о сегментах в кластере
-    cluster_segments = features_df[features_df['Кластер'] == cluster_id]
-    cluster_segments.to_excel(f"{cluster_dir}/segments_info_cluster_{cluster_id}.xlsx", index=False)
-    
-    # 4. Создаем детальные графики
-    create_detailed_prediction_plots(cluster_id, predictions, metrics, output_columns, 
-                                   train_seg_id, test_seg_id)
-    
-    print(f"✓ Результаты кросс-сегментного анализа для кластера {cluster_id} сохранены")
-    
-    return metrics_df
-
-def create_comprehensive_analysis(all_cluster_results, output_columns, features_df):
-    """
-    Создает комплексный анализ результатов всех кластеров.
-    """
-    print("\n" + "=" * 60)
-    print("КОМПЛЕКСНЫЙ АНАЛИЗ РЕЗУЛЬТАТОВ")
-    print("=" * 60)
-    
-    # 1. Сводная таблица
-    summary_data = []
-    
-    for cluster_id, results in all_cluster_results.items():
-        if not results:
-            continue
-            
-        summary = {
-            'Кластер': cluster_id,
-            'Сегмент_обучения': results['metrics']['Сегмент_обучения'],
-            'Сегмент_тестирования': results['metrics']['Сегмент_тестирования'],
-            'Эпохи_обучения': results['metrics']['Эпохи_обучения'],
-            'Средний_R2': results['metrics']['Средний_R2'],
-            'Средний_MSE': results['metrics']['Средний_MSE'],
-            'Средний_RMSE': results['metrics']['Средний_RMSE'],
-            'Средний_MAE': results['metrics']['Средний_MAE']
-        }
+    # Прогноз на тестовых данных
+    if len(X_all) > 10:
+        test_idx = min(10, len(X_all))
+        X_test = X_all[:test_idx]
+        y_true = y_all[:test_idx]
         
-        # Добавляем метрики для каждого параметра
-        for col in output_columns:
-            summary[f'{col}_R2'] = results['metrics'][f'{col}_R2']
-            summary[f'{col}_MSE'] = results['metrics'][f'{col}_MSE']
+        y_pred_scaled = model.predict(X_test, verbose=0)
         
-        summary_data.append(summary)
-    
-    if not summary_data:
-        print("Нет данных для создания анализа")
-        return None
-    
-    # Создаем DataFrame сводной таблицы
-    summary_df = pd.DataFrame(summary_data)
-    summary_df = summary_df.sort_values('Средний_R2', ascending=False)
-    summary_df.to_excel("comprehensive_analysis_summary.xlsx", index=False)
-    
-    # 2. Визуализация результатов
-    create_comprehensive_visualizations(all_cluster_results, summary_df, features_df, output_columns)
-    
-    return summary_df
-
-def create_comprehensive_visualizations(all_cluster_results, summary_df, features_df, output_columns):
-    """
-    Создает комплексные визуализации результатов.
-    """
-    try:
-        # 1. Сравнение кластеров по точности
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        # Обратное преобразование масштаба
+        y_pred = np.zeros_like(y_pred_scaled)
+        y_true_original = np.zeros_like(y_true)
         
-        # График 1: Средний R2 по кластерам
-        ax = axes[0, 0]
-        clusters = summary_df['Кластер'].astype(str)
-        r2_values = summary_df['Средний_R2'].values
+        for target_idx in range(y_pred_scaled.shape[1]):
+            y_pred[:, target_idx] = y_scalers_list[0][target_idx].inverse_transform(
+                y_pred_scaled[:, target_idx].reshape(-1, 1)
+            ).flatten()
+            y_true_original[:, target_idx] = y_scalers_list[0][target_idx].inverse_transform(
+                y_true[:, target_idx].reshape(-1, 1)
+            ).flatten()
         
-        bars = ax.bar(clusters, r2_values, color=plt.cm.viridis(np.linspace(0, 1, len(clusters))))
-        ax.set_title('Средний R² по кластерам', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Кластер', fontsize=12)
-        ax.set_ylabel('R²', fontsize=12)
-        ax.set_ylim([0, 1])
-        ax.grid(True, alpha=0.3, axis='y')
+        # Графики прогнозов для каждой целевой переменной
+        for i, target_col in enumerate(target_columns):
+            plt.figure(figsize=(10, 6))
+            plt.plot(y_true_original[:, i], label='True Values', marker='o', linewidth=2, markersize=6)
+            plt.plot(y_pred[:, i], label='Predictions', marker='s', linewidth=2, markersize=6)
+            plt.title(f'Predictions vs True Values - {target_col} (Cluster {cluster_id})')
+            plt.xlabel('Sample Index')
+            plt.ylabel('Value')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.savefig(f'predictions_{target_col}_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
+            plt.close()
         
-        for bar, r2 in zip(bars, r2_values):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                   f'{r2:.3f}', ha='center', va='bottom', fontsize=10)
+        # Сводный график всех прогнозов
+        plt.figure(figsize=(15, 10))
+        n_targets = len(target_columns)
+        n_cols = 3
+        n_rows = (n_targets + n_cols - 1) // n_cols
         
-        # График 2: Тепловая карта R2 по параметрам и кластерам
-        ax = axes[0, 1]
-        r2_matrix = []
+        for i, target_col in enumerate(target_columns):
+            plt.subplot(n_rows, n_cols, i+1)
+            plt.plot(y_true_original[:, i], label='True', marker='o', markersize=4, alpha=0.7)
+            plt.plot(y_pred[:, i], label='Pred', marker='s', markersize=4, alpha=0.7)
+            plt.title(f'{target_col}', fontsize=10)
+            plt.xlabel('Sample')
+            plt.ylabel('Value')
+            plt.legend(fontsize=8)
+            plt.grid(True, alpha=0.3)
         
-        for cluster_id in summary_df['Кластер']:
-            if cluster_id in all_cluster_results:
-                cluster_r2 = []
-                for col in output_columns:
-                    cluster_r2.append(all_cluster_results[cluster_id]['metrics'][f'{col}_R2'])
-                r2_matrix.append(cluster_r2)
-        
-        if r2_matrix:
-            r2_matrix = np.array(r2_matrix)
-            im = ax.imshow(r2_matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
-            
-            ax.set_xticks(np.arange(len(output_columns)))
-            ax.set_xticklabels(output_columns, rotation=45, ha='right')
-            ax.set_yticks(np.arange(len(summary_df)))
-            ax.set_yticklabels(summary_df['Кластер'].astype(str))
-            
-            # Добавляем значения в ячейки
-            for i in range(len(summary_df)):
-                for j in range(len(output_columns)):
-                    text = ax.text(j, i, f'{r2_matrix[i, j]:.2f}',
-                                 ha="center", va="center", color="black", fontsize=8)
-            
-            ax.set_title('R² по параметрам и кластерам', fontsize=14, fontweight='bold')
-            plt.colorbar(im, ax=ax, label='R² score')
-        
-        # График 3: Распределение сегментов по кластерам
-        ax = axes[1, 0]
-        cluster_counts = features_df['Кластер'].value_counts().sort_index()
-        
-        colors = plt.cm.Set2(np.linspace(0, 1, len(cluster_counts)))
-        wedges, texts, autotexts = ax.pie(cluster_counts.values, labels=cluster_counts.index.astype(str),
-                                         autopct='%1.1f%%', colors=colors, startangle=90)
-        
-        ax.set_title('Распределение сегментов по кластерам', fontsize=14, fontweight='bold')
-        
-        # График 4: Сравнение MSE по кластерам
-        ax = axes[1, 1]
-        mse_values = summary_df['Средний_MSE'].values
-        
-        ax.bar(clusters, mse_values, color=plt.cm.plasma(np.linspace(0, 1, len(clusters))))
-        ax.set_title('Средний MSE по кластерам', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Кластер', fontsize=12)
-        ax.set_ylabel('MSE', fontsize=12)
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.set_yscale('log')
-        
-        plt.suptitle('КОМПЛЕКСНЫЙ АНАЛИЗ РЕЗУЛЬТАТОВ КЛАСТЕРИЗАЦИИ И ПРОГНОЗИРОВАНИЯ', 
-                    fontsize=18, fontweight='bold', y=1.02)
+        plt.suptitle(f'All Predictions - Cluster {cluster_id}', fontsize=14, y=1.02)
         plt.tight_layout()
-        plt.savefig('comprehensive_analysis_visualization.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'all_predictions_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
         plt.close()
+    
+    print(f"Модель для кластера {cluster_id} обучена и сохранена")
+
+# 7. Классификация нового временного ряда и прогнозирование
+def classify_and_predict(new_segment_df, features_df, kmeans_model, scaler, lstm_models, lstm_scalers_X, lstm_scalers_y, 
+                         feature_columns, target_columns, sequence_length=10):
+    """
+    Классифицирует новый временной ряд и делает прогноз с помощью соответствующей LSTM модели
+    """
+    # 1. Вычисление характеристик для нового ряда
+    new_features = calculate_temporal_features(new_segment_df, feature_columns_for_stats)
+    
+    # 2. Подготовка данных для классификации
+    feature_names = [col for col in features_df.columns if col not in ['segment_id', 'cluster']]
+    X_new = np.array([new_features.get(feat, 0) for feat in feature_names]).reshape(1, -1)
+    
+    # 3. Масштабирование и классификация
+    X_new_scaled = scaler.transform(X_new)
+    cluster_label = kmeans_model.predict(X_new_scaled)[0]
+    
+    print(f"Новый ряд отнесен к кластеру: {cluster_label}")
+    
+    # 4. Проверка наличия модели для этого кластера
+    if cluster_label not in lstm_models:
+        print(f"Модель для кластера {cluster_label} не найдена")
+        return None, None, cluster_label
+    
+    # 5. Подготовка данных для LSTM
+    if len(new_segment_df) < sequence_length:
+        print(f"Недостаточно данных для прогноза. Нужно минимум {sequence_length} точек")
+        return None, None, cluster_label
+    
+    # Берем последние sequence_length точек
+    X_data = new_segment_df[feature_columns].values[-sequence_length:]
+    
+    # Масштабирование признаков
+    X_scaled = np.zeros((1, sequence_length, len(feature_columns)))
+    for feature_idx in range(len(feature_columns)):
+        feature_scaler = lstm_scalers_X[cluster_label][feature_idx]
+        feature_data = X_data[:, feature_idx].reshape(-1, 1)
+        feature_scaled = feature_scaler.transform(feature_data).flatten()
+        X_scaled[0, :, feature_idx] = feature_scaled
+    
+    # 6. Прогнозирование
+    y_pred_scaled = lstm_models[cluster_label].predict(X_scaled, verbose=0)
+    
+    # Обратное преобразование масштаба
+    y_pred = np.zeros(len(target_columns))
+    for target_idx in range(len(target_columns)):
+        y_pred[target_idx] = lstm_scalers_y[cluster_label][target_idx].inverse_transform(
+            y_pred_scaled[:, target_idx].reshape(-1, 1)
+        ).flatten()[0]
+    
+    return y_pred, X_data[-1], cluster_label
+
+# Пример использования для классификации и прогноза
+print("\n--- Пример классификации и прогноза для нового ряда ---")
+
+# Создаем тестовый сегмент (можно взять существующий)
+test_segment_idx = 5
+if test_segment_idx < len(segments):
+    new_segment = segments[test_segment_idx]
+    
+    prediction, last_values, cluster = classify_and_predict(
+        new_segment, 
+        features_df, 
+        kmeans, 
+        scaler, 
+        lstm_models, 
+        lstm_scalers_X,
+        lstm_scalers_y,
+        lstm_feature_columns,
+        target_columns
+    )
+    
+    if prediction is not None:
+        print(f"\nПрогнозируемые значения:")
+        for i, target_col in enumerate(target_columns):
+            print(f"  {target_col}: {prediction[i]:.6f}")
         
-        # 2. График сравнения параметров
-        plt.figure(figsize=(14, 8))
+        # Визуализация прогнозов
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         
-        param_avg_r2 = []
-        param_avg_mse = []
+        # График временного ряда
+        axes[0, 0].plot(new_segment['F'].values, label='F', marker='o', markersize=3)
+        axes[0, 0].axvline(x=len(new_segment)-10, color='r', linestyle='--', label='Prediction Window')
+        axes[0, 0].set_title(f'Time Series F (Cluster {cluster})')
+        axes[0, 0].set_xlabel('Time Step')
+        axes[0, 0].set_ylabel('Value')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
         
-        for col in output_columns:
-            r2_values = []
-            mse_values = []
-            for cluster_id, results in all_cluster_results.items():
-                if results:
-                    r2_values.append(results['metrics'][f'{col}_R2'])
-                    mse_values.append(results['metrics'][f'{col}_MSE'])
-            
-            if r2_values:
-                param_avg_r2.append(np.mean(r2_values))
-                param_avg_mse.append(np.mean(mse_values))
-        
-        x = np.arange(len(output_columns))
+        # График прогнозов vs последние известные значения
+        x_pos = np.arange(len(target_columns))
         width = 0.35
+        last_known = [new_segment[col].iloc[-1] for col in target_columns]
         
-        fig, ax1 = plt.subplots(figsize=(14, 8))
+        axes[0, 1].bar(x_pos - width/2, last_known, width, label='Last Known', alpha=0.7)
+        axes[0, 1].bar(x_pos + width/2, prediction, width, label='Predicted', alpha=0.7)
+        axes[0, 1].set_xlabel('Target Variables')
+        axes[0, 1].set_ylabel('Value')
+        axes[0, 1].set_title(f'Predictions vs Last Known Values (Cluster {cluster})')
+        axes[0, 1].set_xticks(x_pos)
+        axes[0, 1].set_xticklabels(target_columns, rotation=45, ha='right')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, axis='y')
         
-        # График R2
-        bars1 = ax1.bar(x - width/2, param_avg_r2, width, label='Средний R²', color='skyblue', alpha=0.7)
-        ax1.set_xlabel('Параметр', fontsize=12)
-        ax1.set_ylabel('Средний R²', fontsize=12, color='skyblue')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(output_columns, rotation=45, ha='right')
-        ax1.set_ylim([0, 1])
-        ax1.tick_params(axis='y', labelcolor='skyblue')
-        ax1.grid(True, alpha=0.3, axis='y')
+        # График относительной ошибки
+        errors = []
+        for i, col in enumerate(target_columns):
+            if last_known[i] != 0:
+                error = abs(prediction[i] - last_known[i]) / abs(last_known[i]) * 100
+            else:
+                error = abs(prediction[i]) * 100
+            errors.append(error)
         
-        # График MSE на второй оси Y
-        ax2 = ax1.twinx()
-        bars2 = ax2.bar(x + width/2, param_avg_mse, width, label='Средний MSE', color='salmon', alpha=0.7)
-        ax2.set_ylabel('Средний MSE', fontsize=12, color='salmon')
-        ax2.tick_params(axis='y', labelcolor='salmon')
-        ax2.set_yscale('log')
+        colors = ['green' if err < 20 else 'orange' if err < 50 else 'red' for err in errors]
+        axes[1, 0].bar(target_columns, errors, color=colors, alpha=0.7)
+        axes[1, 0].axhline(y=20, color='r', linestyle='--', label='20% threshold')
+        axes[1, 0].set_xlabel('Target Variables')
+        axes[1, 0].set_ylabel('Relative Error (%)')
+        axes[1, 0].set_title('Prediction Relative Error')
+        axes[1, 0].set_xticklabels(target_columns, rotation=45, ha='right')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, axis='y')
         
-        # Объединяем легенды
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        # График нескольких целевых переменных
+        for i, col in enumerate(target_columns[:3]):
+            axes[1, 1].plot(new_segment[col].values, label=col, alpha=0.7)
+        axes[1, 1].set_title('Target Variables in Segment')
+        axes[1, 1].set_xlabel('Time Step')
+        axes[1, 1].set_ylabel('Value')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True)
         
-        plt.title('СРАВНЕНИЕ КАЧЕСТВА ПРОГНОЗОВ ПО ПАРАМЕТРАМ', fontsize=16, fontweight='bold')
+        plt.suptitle(f'Prediction Results for Test Segment (Cluster {cluster})', fontsize=14, y=1.02)
         plt.tight_layout()
-        plt.savefig('parameter_comparison_analysis.png', dpi=150, bbox_inches='tight')
+        plt.savefig('new_series_multivariate_prediction.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        print("✓ Созданы комплексные визуализации результатов")
-        
-    except Exception as e:
-        print(f"Ошибка при создании визуализаций: {e}")
+        print("\nГрафик сохранен как 'new_series_multivariate_prediction.png'")
 
-def main():
-    """
-    Главная функция - полный анализ с улучшенными моделями LSTM.
-    """
-    print("=" * 80)
-    print("МНОГОМЕРНЫЙ АНАЛИЗ С УЛУЧШЕННЫМИ МОДЕЛЯМИ LSTM")
-    print("=" * 80)
-    print("🎯 СТРАТЕГИЯ: Обучение на одном сегменте кластера, тестирование на другом")
-    print("📈 УЛУЧШЕНИЯ: Более глубокая архитектура, регуляризация, оптимизация")
-    print("=" * 80)
-    
-    # Конфигурация
-    file_path = 'Dataset.xlsx'
-    segment_length = 20
-    
-    # Определяем входные и выходные параметры
-    # Входные параметры
-    input_columns = ['kγ', 'kβ', 'α0', 'lψ', 'V0', 'LWx', 'ω*', 'e1', 'e6', 'F1', 'F6', 'F']
-    
-    # Выходные параметры (прогнозируемые)
-    output_columns = ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6']
-    
-    try:
-        # ===== 1. ЗАГРУЗКА И ПРЕДВАРИТЕЛЬНАЯ ОБРАБОТКА =====
-        print("\n1. ЗАГРУЗКА И ПРЕДВАРИТЕЛЬНАЯ ОБРАБОТКА")
-        print("-" * 50)
-        
-        df = pd.read_excel(file_path)
-        print(f"✓ Загружено {len(df)} записей")
-        print(f"✓ Входные параметры: {', '.join(input_columns[:5])}...")
-        print(f"✓ Выходные параметры: {', '.join(output_columns)}")
-        
-        # Проверяем наличие всех колонок
-        missing_input = [col for col in input_columns if col not in df.columns]
-        missing_output = [col for col in output_columns if col not in df.columns]
-        
-        if missing_input:
-            print(f"❌ Отсутствуют входные параметры: {missing_input}")
-            # Попробуем использовать все колонки кроме выходных
-            all_columns = df.columns.tolist()
-            input_columns = [col for col in all_columns if col not in output_columns]
-            print(f"Используем все остальные колонки как входные: {len(input_columns)} параметров")
-        
-        if missing_output:
-            print(f"❌ Отсутствуют выходные параметры: {missing_output}")
-            return
-        
-        # Проверяем на NaN
-        nan_counts = df[input_columns + output_columns].isnull().sum()
-        total_nan = nan_counts.sum()
-        if total_nan > 0:
-            print(f"\nОбнаружено NaN значений: {total_nan}")
-            print("Заполняем NaN средними значениями...")
-            df[input_columns + output_columns] = df[input_columns + output_columns].fillna(
-                df[input_columns + output_columns].mean()
-            )
-        
-        # ===== 2. СЕГМЕНТАЦИЯ И ВЫЧИСЛЕНИЕ ХАРАКТЕРИСТИК =====
-        print("\n2. СЕГМЕНТАЦИЯ И ВЫЧИСЛЕНИЕ ХАРАКТЕРИСТИК")
-        print("-" * 50)
-        
-        segments = []
-        all_features = []
-        segment_data_dict = {}
-        
-        segment_counter = 0
-        for i in range(0, len(df), segment_length):
-            segment = df.iloc[i:i + segment_length]
-            if len(segment) >= 10:  # Увеличиваем минимальную длину для LSTM
-                segment_counter += 1
-                seg_id = f"Сегмент_{segment_counter:03d}"
-                segments.append(segment)
-                
-                # Вычисляем характеристики для выходных параметров
-                features = calculate_time_series_features(segment, seg_id, i, output_columns)
-                if features:
-                    all_features.append(features)
-                
-                # Сохраняем полные данные сегмента для LSTM
-                segment_data_dict[seg_id] = segment[input_columns + output_columns]
-        
-        if not all_features:
-            print("❌ Не удалось вычислить характеристики для сегментов")
-            return
-            
-        features_df = pd.DataFrame(all_features)
-        print(f"✓ Создано {len(segments)} сегментов")
-        print(f"✓ Вычислено {len(all_features)} наборов характеристик")
-        
-        # Проверяем features_df на NaN
-        nan_in_features = features_df.isnull().sum().sum()
-        if nan_in_features > 0:
-            print(f"\nОбнаружено NaN в характеристиках: {nan_in_features}")
-            print("Заполняем средними значениями...")
-            features_df = features_df.fillna(features_df.mean())
-        
-        # ===== 3. КЛАСТЕРИЗАЦИЯ K-MEANS =====
-        print("\n3. КЛАСТЕРИЗАЦИЯ K-MEANS")
-        print("-" * 50)
-        
-        # Используем автоматическое определение количества кластеров
-        features_df, cluster_labels, scaler, cluster_cols, kmeans = perform_kmeans_clustering(
-            features_df, n_clusters='auto'
-        )
-        
-        # Сохраняем результаты кластеризации
-        features_df.to_excel("improved_clustering_results.xlsx", index=False)
-        print("✓ Результаты кластеризации сохранены в 'improved_clustering_results.xlsx'")
-        
-        # ===== 4. КРОСС-СЕГМЕНТНОЕ ОБУЧЕНИЕ И ТЕСТИРОВАНИЕ =====
-        print("\n4. КРОСС-СЕГМЕНТНОЕ ОБУЧЕНИЕ С УЛУЧШЕННЫМИ МОДЕЛЯМИ")
-        print("-" * 50)
-        print("🎯 УЛУЧШЕННАЯ АРХИТЕКТУРА:")
-        print("   • 3-слойная LSTM сеть")
-        print("   • Batch Normalization")
-        print("   • L2 регуляризация")
-        print("   • ReduceLROnPlateau callback")
-        print("   • Более глубокие слои")
-        print("-" * 50)
-        
-        # Группируем сегменты по кластерам
-        cluster_segments = {}
-        for seg_id, segment_data in segment_data_dict.items():
-            # Находим кластер для этого сегмента
-            seg_features = features_df[features_df['Сегмент_ID'] == seg_id]
-            if not seg_features.empty:
-                cluster_id = seg_features['Кластер'].iloc[0]
-                if cluster_id not in cluster_segments:
-                    cluster_segments[cluster_id] = {}
-                cluster_segments[cluster_id][seg_id] = segment_data
-        
-        print(f"\nРАСПРЕДЕЛЕНИЕ СЕГМЕНТОВ ПО КЛАСТЕРАМ:")
-        for cluster_id in sorted(cluster_segments.keys()):
-            seg_count = len(cluster_segments[cluster_id])
-            print(f"  Кластер {cluster_id}: {seg_count} сегментов")
-        
-        # Обучаем и тестируем модели для каждого кластера
-        all_cluster_results = {}
-        
-        trained_clusters = 0
-        for cluster_id, cluster_data in cluster_segments.items():
-            if len(cluster_data) >= 2:  # Только кластеры с минимум 2 сегментами
-                
-                predictions, metrics, train_seg_id, test_seg_id = train_and_test_cross_segment(
-                    cluster_data, cluster_id, input_columns, output_columns,
-                    sequence_length=20, epochs=100
-                )
-                
-                if predictions and metrics:
-                    all_cluster_results[cluster_id] = {
-                        'predictions': predictions,
-                        'metrics': metrics,
-                        'train_segment': train_seg_id,
-                        'test_segment': test_seg_id
-                    }
-                    trained_clusters += 1
-                    
-                    # Сохраняем результаты для кластера
-                    metrics_df = save_cross_segment_results(
-                        cluster_id, predictions, metrics, features_df, output_columns,
-                        train_seg_id, test_seg_id
-                    )
-                else:
-                    print(f"\n❌ Не удалось обучить модель для кластера {cluster_id}")
-            else:
-                print(f"\n⚠️  Кластер {cluster_id}: Пропущен (требуется минимум 2 сегмента, доступно: {len(cluster_data)})")
-        
-        if trained_clusters == 0:
-            print("\n❌ Не удалось обучить ни одной модели LSTM")
-            return
-        
-        # ===== 5. КОМПЛЕКСНЫЙ АНАЛИЗ РЕЗУЛЬТАТОВ =====
-        print("\n5. КОМПЛЕКСНЫЙ АНАЛИЗ РЕЗУЛЬТАТОВ")
-        print("-" * 50)
-        
-        # Создаем комплексный анализ
-        summary_df = create_comprehensive_analysis(all_cluster_results, output_columns, features_df)
-        
-        if summary_df is not None:
-            # Выводим статистику
-            print(f"\n📊 ОБЩАЯ СТАТИСТИКА:")
-            print(f"   Обучено кластеров: {trained_clusters}")
-            print(f"   Средний R² по всем кластерам: {summary_df['Средний_R2'].mean():.4f}")
-            print(f"   Средний MSE по всем кластерам: {summary_df['Средний_MSE'].mean():.8f}")
-            print(f"   Лучший кластер (R²={summary_df['Средний_R2'].max():.4f}): Кластер {summary_df['Средний_R2'].idxmax()}")
-            print(f"   Худший кластер (R²={summary_df['Средний_R2'].min():.4f}): Кластер {summary_df['Средний_R2'].idxmin()}")
-        
-        # ===== 6. СОХРАНЕНИЕ ИТОГОВЫХ РЕЗУЛЬТАТОВ =====
-        print("\n6. СОХРАНЕНИЕ ИТОГОВЫХ РЕЗУЛЬТАТОВ")
-        print("-" * 50)
-        
-        # Сохраняем все метрики в один файл
-        all_metrics_list = []
-        for cluster_id, results in all_cluster_results.items():
-            all_metrics_list.append(results['metrics'])
-        
-        if all_metrics_list:
-            all_metrics_df = pd.DataFrame(all_metrics_list)
-            all_metrics_df.to_excel("all_improved_metrics.xlsx", index=False)
-            print("✓ Все метрики сохранены в 'all_improved_metrics.xlsx'")
-        
-        # Сохраняем информацию о моделях
-        models_info = {
-            'Всего_кластеров': len(cluster_segments),
-            'Обучено_кластеров': trained_clusters,
-            'Стратегия_обучения': 'Кросс-сегментное с улучшенными моделями',
-            'Входные_параметры': input_columns,
-            'Выходные_параметры': output_columns,
-            'Архитектура_LSTM': {
-                'layers': 'LSTM(64)-BN-Dropout-LSTM(32)-BN-Dropout-LSTM(16)-BN-Dropout-Dense(64)-BN-Dropout-Dense(32)-BN-Dense(7)',
-                'regularization': 'L2 regularization',
-                'optimizer': 'Adam with learning rate scheduling',
-                'callbacks': 'EarlyStopping, ReduceLROnPlateau'
-            },
-            'Параметры_обучения': {
-                'sequence_length': 10,
-                'epochs': 100,
-                'batch_size': 32,
-                'validation_split': 0.2
-            }
-        }
-        
-        import json
-        with open('improved_analysis_config.json', 'w', encoding='utf-8') as f:
-            json.dump(models_info, f, indent=2, ensure_ascii=False)
-        
-        print("✓ Конфигурация анализа сохранена в 'improved_analysis_config.json'")
-        
-        # ===== 7. ФИНАЛЬНЫЙ ОТЧЕТ =====
-        print("\n7. ФИНАЛЬНЫЙ ОТЧЕТ")
-        print("-" * 50)
-        
-        print("\n" + "=" * 80)
-        print("УЛУЧШЕННЫЙ АНАЛИЗ УСПЕШНО ЗАВЕРШЕН!")
-        print("=" * 80)
-        
-        print(f"\n🎯 РЕЗУЛЬТАТЫ:")
-        print(f"   📊 Обучено кластеров: {trained_clusters}")
-        print(f"   📈 Средняя точность (R²): {summary_df['Средний_R2'].mean():.4f}" if summary_df is not None else "")
-        print(f"   📉 Средняя ошибка (MSE): {summary_df['Средний_MSE'].mean():.8f}" if summary_df is not None else "")
-        
-        print(f"\n📁 СОЗДАННЫЕ ФАЙЛЫ:")
-        print(f"   1. improved_clustering_results.xlsx - результаты кластеризации")
-        print(f"   2. all_improved_metrics.xlsx - все метрики моделей")
-        print(f"   3. comprehensive_analysis_summary.xlsx - сводная таблица")
-        print(f"   4. improved_analysis_config.json - конфигурация")
-        print(f"   5. comprehensive_analysis_visualization.png - визуализация")
-        print(f"   6. parameter_comparison_analysis.png - сравнение параметров")
-        print(f"   7. Папки cluster_X_results/ - детальные результаты по кластерам")
-        
-        print(f"\n📂 В ПАПКАХ CLUSTER_X_RESULTS/ СОДЕРЖАТСЯ:")
-        print(f"   • Детальные графики прогнозов для каждого параметра")
-        print(f"   • Графики обучения и ошибок")
-        print(f"   • Таблицы с метриками и прогнозами")
-        print(f"   • Информация о сегментах обучения и тестирования")
-        
-        print(f"\n📈 УЛУЧШЕНИЯ ТОЧНОСТИ:")
-        print(f"   • Более глубокая архитектура LSTM (3 слоя)")
-        print(f"   • Batch Normalization для стабилизации обучения")
-        print(f"   • L2 регуляризация для предотвращения переобучения")
-        print(f"   • Адаптивный learning rate (ReduceLROnPlateau)")
-        print(f"   • Ранняя остановка для оптимального времени обучения")
-        
-    except FileNotFoundError:
-        print(f"\n❌ ОШИБКА: Файл '{file_path}' не найден!")
-    except Exception as e:
-        print(f"\n❌ ОШИБКА: {e}")
-        import traceback
-        traceback.print_exc()
+# 8. Дополнительная визуализация характеристик кластеров
+plt.figure(figsize=(15, 10))
+key_features = ['F_mean', 'F_variance', 'F_trend', 'F1_mean']
 
-if __name__ == "__main__":
-    # Проверка доступности TensorFlow
-    try:
-        import tensorflow as tf
-        print(f"TensorFlow версия: {tf.__version__}")
-        gpu_devices = tf.config.list_physical_devices('GPU')
-        gpu_available = len(gpu_devices) > 0
-        print(f"GPU доступен: {gpu_available}")
-        if gpu_available:
-            print(f"Используется GPU: {gpu_devices[0]}")
-    except ImportError:
-        print("❌ TensorFlow не установлен. Установите: pip install tensorflow")
-        exit(1)
-    
-    main()
+for i, feature in enumerate(key_features, 1):
+    if feature in features_df.columns:
+        plt.subplot(2, 2, i)
+        for cluster_id in range(optimal_k):
+            cluster_data = features_df[features_df['cluster'] == cluster_id][feature]
+            if len(cluster_data) > 0:
+                plt.hist(cluster_data, alpha=0.5, label=f'Cluster {cluster_id}', bins=10)
+        plt.title(f'Distribution of {feature} by Cluster')
+        plt.xlabel(feature)
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('cluster_feature_distributions.png', dpi=300, bbox_inches='tight')
+plt.close()
+
+# 9. Сводный отчет по кластерам
+print("\n" + "="*60)
+print("СВОДНЫЙ ОТЧЕТ ПО КЛАСТЕРАМ")
+print("="*60)
+print(f"Всего сегментов: {len(segments)}")
+print(f"Число кластеров: {optimal_k}")
+print("\nРаспределение сегментов по кластерам:")
+cluster_stats = features_df['cluster'].value_counts().sort_index()
+for cluster_id, count in cluster_stats.items():
+    percentage = count/len(segments)*100 if len(segments) > 0 else 0
+    print(f"  Кластер {cluster_id}: {count} сегментов ({percentage:.1f}%)")
+
+print(f"\nОбучено LSTM моделей: {len(lstm_models)}")
+print(f"Прогнозируемые переменные: {', '.join(target_columns)}")
+
+# 10. Создание отчета в Excel
+report_data = {
+    'Metric': [
+        'Total Segments',
+        'Number of Clusters',
+        'Segment Length',
+        'LSTM Sequence Length',
+        'Target Variables',
+        'LSTM Models Trained'
+    ],
+    'Value': [
+        len(segments),
+        optimal_k,
+        segment_length,
+        10,
+        len(target_columns),
+        len(lstm_models)
+    ]
+}
+
+cluster_report = []
+for cluster_id in range(optimal_k):
+    count = len(features_df[features_df['cluster'] == cluster_id])
+    percentage = count/len(segments)*100 if len(segments) > 0 else 0
+    has_model = 'Yes' if cluster_id in lstm_models else 'No'
+    cluster_report.append({
+        'Cluster ID': cluster_id,
+        'Segments Count': count,
+        'Percentage (%)': round(percentage, 1),
+        'LSTM Model': has_model
+    })
+
+report_df1 = pd.DataFrame(report_data)
+report_df2 = pd.DataFrame(cluster_report)
+
+with pd.ExcelWriter('analysis_report.xlsx') as writer:
+    report_df1.to_excel(writer, sheet_name='Summary', index=False)
+    report_df2.to_excel(writer, sheet_name='Cluster Distribution', index=False)
+    features_df.to_excel(writer, sheet_name='Segment Features', index=False)
+
+print("\n" + "="*60)
+print("СОЗДАННЫЕ ФАЙЛЫ")
+print("="*60)
+files_categories = {
+    "Данные": [
+        "segmented_time_series.xlsx",
+        "temporal_features.xlsx", 
+        "temporal_features_with_clusters.xlsx",
+        "analysis_report.xlsx"
+    ],
+    "Графики": [
+        "elbow_method.png",
+        "cluster_feature_distributions.png",
+        "new_series_multivariate_prediction.png"
+    ],
+    "Модели LSTM": [f"lstm_model_cluster_{cluster_id}.keras" for cluster_id in lstm_models.keys()],
+    "Графики обучения": []
+}
+
+# Добавляем графики обучения
+for cluster_id in lstm_models.keys():
+    files_categories["Графики обучения"].append(f"loss_cluster_{cluster_id}.png")
+    files_categories["Графики обучения"].append(f"all_predictions_cluster_{cluster_id}.png")
+    for target_col in target_columns:
+        files_categories["Графики обучения"].append(f"predictions_{target_col}_cluster_{cluster_id}.png")
+
+for category, files in files_categories.items():
+    print(f"\n{category}:")
+    for file in files[:10]:  # Показываем первые 10 файлов в каждой категории
+        print(f"  - {file}")
+    if len(files) > 10:
+        print(f"  ... и еще {len(files) - 10} файлов")
+
+print("\n" + "="*60)
+print("СКРИПТ УСПЕШНО ВЫПОЛНЕН!")
+print("="*60)
