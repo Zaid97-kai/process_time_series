@@ -23,14 +23,6 @@ target_columns = ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6']
 def smooth_data(df, window_size=3, method='moving_average'):
     """
     Сглаживание данных для уменьшения шума и скачков
-    
-    Параметры:
-    - df: исходный DataFrame
-    - window_size: размер окна для сглаживания
-    - method: метод сглаживания ('moving_average', 'savitzky_golay', 'exponential')
-    
-    Возвращает:
-    - DataFrame со сглаженными данными
     """
     df_smoothed = df.copy()
     
@@ -107,7 +99,7 @@ visualize_smoothing(df, df_smoothed)
 # ================================================
 
 # 1. Разделение ВРЕМЕННОГО РЯДА на сегменты длиной 25 записей (используем сглаженные данные)
-segment_length = 20
+segment_length = 12
 num_segments = len(df_smoothed) // segment_length
 segments = []
 
@@ -250,6 +242,7 @@ lstm_models = {}
 lstm_scalers_X = {}
 lstm_scalers_y = {}
 lstm_mape_results = {}  # Для хранения результатов MAPE
+lstm_prediction_details = {}  # Для хранения деталей прогнозов
 
 # Выбираем признаки для LSTM (упрощенный набор)
 lstm_feature_columns = ['e1', 'e6', 'F', 'F1', 'F6']
@@ -309,8 +302,8 @@ for cluster_id in range(optimal_k):
     # Обучение модели
     history = model.fit(
         X_all, y_all,
-        epochs=200,
-        batch_size=16,
+        epochs=100,
+        batch_size=32,
         validation_split=0.2,
         verbose=0
     )
@@ -358,6 +351,10 @@ for cluster_id in range(optimal_k):
                 y_true[:, target_idx].reshape(-1, 1)
             ).flatten()
         
+        # Расчет ошибок
+        errors = y_pred - y_true_original
+        absolute_errors = np.abs(errors)
+        
         # Расчет MAPE для каждой целевой переменной
         mape_values = []
         for target_idx in range(len(target_columns)):
@@ -374,7 +371,15 @@ for cluster_id in range(optimal_k):
         
         lstm_mape_results[cluster_id] = mape_values
         
-        # Графики прогнозов для каждой целевой переменной
+        # Сохраняем детали прогнозов для кластера
+        lstm_prediction_details[cluster_id] = {
+            'y_true': y_true_original,
+            'y_pred': y_pred,
+            'errors': errors,
+            'absolute_errors': absolute_errors
+        }
+        
+        # 1. Графики прогнозов для каждой целевой переменной
         for i, target_col in enumerate(target_columns):
             plt.figure(figsize=(10, 6))
             plt.plot(y_true_original[:, i], label='True Values', marker='o', linewidth=2, markersize=6)
@@ -387,7 +392,67 @@ for cluster_id in range(optimal_k):
             plt.savefig(f'predictions_{target_col}_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
             plt.close()
         
-        # Сводный график всех прогнозов
+        # 2. Графики ошибок для каждой целевой переменной
+        for i, target_col in enumerate(target_columns):
+            plt.figure(figsize=(10, 6))
+            plt.plot(errors[:, i], label='Error (Pred - True)', marker='o', linewidth=2, markersize=6, color='red')
+            plt.axhline(y=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+            plt.fill_between(range(len(errors[:, i])), 0, errors[:, i], 
+                            where=errors[:, i] > 0, alpha=0.3, color='green', label='Overestimation')
+            plt.fill_between(range(len(errors[:, i])), 0, errors[:, i], 
+                            where=errors[:, i] < 0, alpha=0.3, color='red', label='Underestimation')
+            plt.title(f'Prediction Errors - {target_col} (Cluster {cluster_id})')
+            plt.xlabel('Sample Index')
+            plt.ylabel('Error')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.savefig(f'errors_{target_col}_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # 3. Сводный график абсолютных ошибок для всех переменных
+        plt.figure(figsize=(15, 10))
+        n_targets = len(target_columns)
+        n_cols = 3
+        n_rows = (n_targets + n_cols - 1) // n_cols
+        
+        for i, target_col in enumerate(target_columns):
+            plt.subplot(n_rows, n_cols, i+1)
+            plt.bar(range(len(absolute_errors[:, i])), absolute_errors[:, i], 
+                   color='skyblue', alpha=0.7, label='Absolute Error')
+            plt.axhline(y=np.mean(absolute_errors[:, i]), color='red', 
+                       linestyle='--', linewidth=2, label=f'Mean: {np.mean(absolute_errors[:, i]):.4f}')
+            plt.title(f'{target_col} - Absolute Errors', fontsize=10)
+            plt.xlabel('Sample')
+            plt.ylabel('Absolute Error')
+            plt.legend(fontsize=8)
+            plt.grid(True, alpha=0.3, axis='y')
+        
+        plt.suptitle(f'Absolute Prediction Errors - Cluster {cluster_id}', fontsize=14, y=1.02)
+        plt.tight_layout()
+        plt.savefig(f'absolute_errors_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 4. Гистограмма распределения ошибок
+        plt.figure(figsize=(12, 8))
+        
+        for i, target_col in enumerate(target_columns):
+            plt.subplot(3, 3, i+1)
+            plt.hist(errors[:, i], bins=15, alpha=0.7, color='steelblue', edgecolor='black')
+            plt.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+            plt.axvline(x=np.mean(errors[:, i]), color='green', linestyle='-', 
+                       linewidth=2, label=f'Mean: {np.mean(errors[:, i]):.4f}')
+            plt.title(f'{target_col}', fontsize=9)
+            plt.xlabel('Error')
+            plt.ylabel('Frequency')
+            plt.legend(fontsize=7)
+            plt.grid(True, alpha=0.3)
+        
+        plt.suptitle(f'Error Distribution - Cluster {cluster_id}', fontsize=14, y=1.02)
+        plt.tight_layout()
+        plt.savefig(f'error_distribution_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 5. Сводный график всех прогнозов
         plt.figure(figsize=(15, 10))
         n_targets = len(target_columns)
         n_cols = 3
@@ -410,7 +475,73 @@ for cluster_id in range(optimal_k):
     
     print(f"Модель для кластера {cluster_id} обучена и сохранена")
 
-# 7. Создание графика MAPE для всех кластеров и целевых переменных
+# 7. Создание подробных таблиц с прогнозами и ошибками
+print("\n--- Создание таблиц с детальными прогнозами ---")
+
+for cluster_id in lstm_prediction_details.keys():
+    if cluster_id in lstm_prediction_details:
+        details = lstm_prediction_details[cluster_id]
+        y_true = details['y_true']
+        y_pred = details['y_pred']
+        errors = details['errors']
+        absolute_errors = details['absolute_errors']
+        
+        # Создаем отдельные таблицы для каждой целевой переменной
+        for target_idx, target_col in enumerate(target_columns):
+            # Создаем DataFrame для текущей целевой переменной
+            prediction_table = pd.DataFrame({
+                'Sample_Index': range(len(y_true[:, target_idx])),
+                'True_Value': y_true[:, target_idx],
+                'Predicted_Value': y_pred[:, target_idx],
+                'Error': errors[:, target_idx],
+                'Absolute_Error': absolute_errors[:, target_idx],
+                'Relative_Error_%': np.where(
+                    y_true[:, target_idx] != 0,
+                    np.abs(errors[:, target_idx]) / np.abs(y_true[:, target_idx]) * 100,
+                    np.abs(errors[:, target_idx]) * 100  # Если истинное значение равно 0
+                )
+            })
+            
+            # Добавляем статистику
+            stats_row = {
+                'Sample_Index': 'Statistics',
+                'True_Value': np.mean(y_true[:, target_idx]),
+                'Predicted_Value': np.mean(y_pred[:, target_idx]),
+                'Error': np.mean(errors[:, target_idx]),
+                'Absolute_Error': np.mean(absolute_errors[:, target_idx]),
+                'Relative_Error_%': np.mean(prediction_table['Relative_Error_%'].iloc[:-1])
+            }
+            
+            # Создаем DataFrame со статистикой и объединяем
+            stats_df = pd.DataFrame([stats_row])
+            prediction_table = pd.concat([prediction_table, stats_df], ignore_index=True)
+            
+            # Сохраняем в Excel
+            filename = f'prediction_details_cluster_{cluster_id}_{target_col}.xlsx'
+            prediction_table.to_excel(filename, index=False)
+            print(f"  Таблица для {target_col} (кластер {cluster_id}) сохранена в {filename}")
+        
+        # Создаем сводную таблицу для всех переменных
+        summary_table = pd.DataFrame()
+        for target_idx, target_col in enumerate(target_columns):
+            col_summary = {
+                'Target_Variable': target_col,
+                'Mean_True': np.mean(y_true[:, target_idx]),
+                'Mean_Predicted': np.mean(y_pred[:, target_idx]),
+                'Mean_Error': np.mean(errors[:, target_idx]),
+                'Std_Error': np.std(errors[:, target_idx]),
+                'MAE': np.mean(absolute_errors[:, target_idx]),
+                'MAPE_%': lstm_mape_results[cluster_id][target_idx] if cluster_id in lstm_mape_results else 0,
+                'Max_Absolute_Error': np.max(absolute_errors[:, target_idx]),
+                'Min_Absolute_Error': np.min(absolute_errors[:, target_idx])
+            }
+            summary_table = pd.concat([summary_table, pd.DataFrame([col_summary])], ignore_index=True)
+        
+        summary_filename = f'prediction_summary_cluster_{cluster_id}.xlsx'
+        summary_table.to_excel(summary_filename, index=False)
+        print(f"  Сводная таблица для кластера {cluster_id} сохранена в {summary_filename}")
+
+# 8. Создание графика MAPE для всех кластеров и целевых переменных
 print("\n--- Создание графика MAPE ---")
 
 # Проверяем, есть ли данные для построения графика MAPE
@@ -493,7 +624,7 @@ if lstm_mape_results:
     
     print("График среднего MAPE сохранен как 'average_mape_by_cluster.png'")
 
-# 8. Классификация нового временного ряда и прогнозирование
+# 9. Классификация нового временного ряда и прогнозирование
 def classify_and_predict(new_segment_df, features_df, kmeans_model, scaler, lstm_models, lstm_scalers_X, lstm_scalers_y, 
                          feature_columns, target_columns, sequence_length=10):
     """
@@ -545,7 +676,7 @@ def classify_and_predict(new_segment_df, features_df, kmeans_model, scaler, lstm
     
     return y_pred, X_data[-1], cluster_label
 
-# 9. Сводный отчет по кластерам
+# 10. Сводный отчет по кластерам
 print("\n" + "="*60)
 print("СВОДНЫЙ ОТЧЕТ ПО КЛАСТЕРАМ")
 print("="*60)
@@ -560,7 +691,7 @@ for cluster_id, count in cluster_stats.items():
 print(f"\nОбучено LSTM моделей: {len(lstm_models)}")
 print(f"Прогнозируемые переменные: {', '.join(target_columns)}")
 
-# 10. Создание отчета в Excel
+# 11. Создание отчета в Excel
 report_data = {
     'Metric': [
         'Total Segments',
@@ -613,7 +744,7 @@ with pd.ExcelWriter('analysis_report.xlsx') as writer:
     report_df2.to_excel(writer, sheet_name='Cluster Distribution', index=False)
     features_df.to_excel(writer, sheet_name='Segment Features', index=False)
 
-# 11. Сохранение результатов MAPE в отдельный Excel файл
+# 12. Сохранение результатов MAPE в отдельный Excel файл
 if lstm_mape_results:
     mape_data = []
     for cluster_id, mape_values in lstm_mape_results.items():
@@ -648,7 +779,7 @@ if lstm_mape_results:
     
     print("\nРезультаты MAPE сохранены в 'mape_results.xlsx'")
 
-# 12. Сохранение сглаженных данных
+# 13. Сохранение сглаженных данных
 df_smoothed.to_excel('smoothed_dataset.xlsx', index=False)
 print("Сглаженные данные сохранены в 'smoothed_dataset.xlsx'")
 
@@ -669,23 +800,46 @@ files_categories = {
         "mape_by_cluster_and_target.png",
         "average_mape_by_cluster.png"
     ],
+    "Таблицы прогнозов": [],
     "Модели LSTM": [f"lstm_model_cluster_{cluster_id}.keras" for cluster_id in lstm_models.keys()],
-    "Графики обучения": []
+    "Графики обучения и ошибок": []
 }
 
-# Добавляем графики обучения
-for cluster_id in lstm_models.keys():
-    files_categories["Графики обучения"].append(f"loss_cluster_{cluster_id}.png")
-    files_categories["Графики обучения"].append(f"all_predictions_cluster_{cluster_id}.png")
+# Добавляем таблицы прогнозов
+for cluster_id in lstm_prediction_details.keys():
+    files_categories["Таблицы прогнозов"].append(f'prediction_summary_cluster_{cluster_id}.xlsx')
     for target_col in target_columns:
-        files_categories["Графики обучения"].append(f"predictions_{target_col}_cluster_{cluster_id}.png")
+        files_categories["Таблицы прогнозов"].append(f'prediction_details_cluster_{cluster_id}_{target_col}.xlsx')
+
+# Добавляем графики обучения и ошибок
+for cluster_id in lstm_models.keys():
+    files_categories["Графики обучения и ошибок"].append(f'loss_cluster_{cluster_id}.png')
+    files_categories["Графики обучения и ошибок"].append(f'all_predictions_cluster_{cluster_id}.png')
+    files_categories["Графики обучения и ошибок"].append(f'absolute_errors_cluster_{cluster_id}.png')
+    files_categories["Графики обучения и ошибок"].append(f'error_distribution_cluster_{cluster_id}.png')
+    for target_col in target_columns:
+        files_categories["Графики обучения и ошибок"].append(f'predictions_{target_col}_cluster_{cluster_id}.png')
+        files_categories["Графики обучения и ошибок"].append(f'errors_{target_col}_cluster_{cluster_id}.png')
 
 for category, files in files_categories.items():
     print(f"\n{category}:")
-    for file in files[:10]:  # Показываем первые 10 файлов в каждой категории
+    # Для таблиц показываем только первые 5 файлов
+    max_files = 5 if category == "Таблицы прогнозов" else 10
+    for file in files[:max_files]:
         print(f"  - {file}")
-    if len(files) > 10:
-        print(f"  ... и еще {len(files) - 10} файлов")
+    if len(files) > max_files:
+        print(f"  ... и еще {len(files) - max_files} файлов")
+
+print("\n" + "="*60)
+print("ДОПОЛНИТЕЛЬНЫЕ ГРАФИКИ И ТАБЛИЦЫ:")
+print("="*60)
+print("1. Графики ошибок для каждой целевой переменной:")
+print("   - errors_[target]_cluster_[id].png - график ошибок прогноза")
+print("   - absolute_errors_cluster_[id].png - график абсолютных ошибок")
+print("   - error_distribution_cluster_[id].png - гистограмма распределения ошибок")
+print("\n2. Детальные таблицы прогнозов:")
+print("   - prediction_details_cluster_[id]_[target].xlsx - таблица с прогнозами и ошибками")
+print("   - prediction_summary_cluster_[id].xlsx - сводная статистика по кластеру")
 
 print("\n" + "="*60)
 print("СКРИПТ УСПЕШНО ВЫПОЛНЕН!")
