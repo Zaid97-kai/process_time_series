@@ -17,15 +17,104 @@ print(f"Колонки: {df.columns.tolist()}")
 # Целевые переменные для прогнозирования
 target_columns = ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6']
 
-# 1. Разделение временного ряда на сегменты длиной 20 записей
+# ================================================
+# ФУНКЦИЯ СГЛАЖИВАНИЯ ДАННЫХ
+# ================================================
+def smooth_data(df, window_size=3, method='moving_average'):
+    """
+    Сглаживание данных для уменьшения шума и скачков
+    
+    Параметры:
+    - df: исходный DataFrame
+    - window_size: размер окна для сглаживания
+    - method: метод сглаживания ('moving_average', 'savitzky_golay', 'exponential')
+    
+    Возвращает:
+    - DataFrame со сглаженными данными
+    """
+    df_smoothed = df.copy()
+    
+    # Список колонок для сглаживания (исключаем целевые переменные)
+    columns_to_smooth = [col for col in df.columns if col not in target_columns]
+    
+    for col in columns_to_smooth:
+        try:
+            if method == 'moving_average':
+                # Простое скользящее среднее
+                df_smoothed[col] = df[col].rolling(window=window_size, center=True, min_periods=1).mean()
+            
+            elif method == 'savitzky_golay':
+                # Фильтр Савицкого-Голея (требует scipy)
+                try:
+                    from scipy.signal import savgol_filter
+                    df_smoothed[col] = savgol_filter(df[col], window_size, 2)
+                except ImportError:
+                    print("Для метода savitzky_golay требуется scipy. Используется moving_average.")
+                    df_smoothed[col] = df[col].rolling(window=window_size, center=True, min_periods=1).mean()
+            
+            elif method == 'exponential':
+                # Экспоненциальное сглаживание
+                df_smoothed[col] = df[col].ewm(span=window_size, adjust=False).mean()
+            
+            # Для целевых переменных используем меньший уровень сглаживания
+            if col in target_columns:
+                df_smoothed[col] = df[col].rolling(window=2, center=True, min_periods=1).mean()
+        
+        except Exception as e:
+            print(f"Ошибка при сглаживании колонки {col}: {e}")
+            df_smoothed[col] = df[col]
+    
+    # Заполняем NaN значения (если остались)
+    df_smoothed = df_smoothed.fillna(method='ffill').fillna(method='bfill')
+    
+    return df_smoothed
+
+# Визуализация сглаживания для ключевых переменных
+def visualize_smoothing(original_df, smoothed_df, columns_to_show=['F', 'F1', 'F6', 'a0'], save_path='smoothing_comparison.png'):
+    """
+    Визуализация сравнения оригинальных и сглаженных данных
+    """
+    n_plots = min(len(columns_to_show), 4)  # Максимум 4 графика
+    fig, axes = plt.subplots(n_plots, 1, figsize=(15, 4*n_plots))
+    
+    if n_plots == 1:
+        axes = [axes]
+    
+    for idx, col in enumerate(columns_to_show[:n_plots]):
+        if col in original_df.columns and col in smoothed_df.columns:
+            axes[idx].plot(original_df[col].values, label='Original', alpha=0.7, linewidth=1)
+            axes[idx].plot(smoothed_df[col].values, label='Smoothed', alpha=0.9, linewidth=1.5)
+            axes[idx].set_title(f'Сравнение сглаживания: {col}', fontsize=12)
+            axes[idx].set_xlabel('Индекс')
+            axes[idx].set_ylabel('Значение')
+            axes[idx].legend()
+            axes[idx].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"График сравнения сглаживания сохранен как '{save_path}'")
+
+# Применяем сглаживание
+print("\n--- Применение сглаживания данных ---")
+df_smoothed = smooth_data(df, window_size=3, method='moving_average')
+
+# Визуализируем результат сглаживания
+visualize_smoothing(df, df_smoothed)
+
+# ================================================
+# ПРОДОЛЖЕНИЕ ОСНОВНОГО КОДА СО СГЛАЖЕННЫМИ ДАННЫМИ
+# ================================================
+
+# 1. Разделение ВРЕМЕННОГО РЯДА на сегменты длиной 25 записей (используем сглаженные данные)
 segment_length = 20
-num_segments = len(df) // segment_length
+num_segments = len(df_smoothed) // segment_length
 segments = []
 
 for i in range(num_segments):
     start_idx = i * segment_length
     end_idx = (i + 1) * segment_length
-    segment = df.iloc[start_idx:end_idx].copy()
+    segment = df_smoothed.iloc[start_idx:end_idx].copy()
     segments.append(segment)
 
 print(f"Создано {len(segments)} сегментов по {segment_length} записей каждый")
@@ -91,16 +180,6 @@ for k in K_range:
     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     kmeans.fit(X_scaled)
     inertia.append(kmeans.inertia_)
-
-# Построение графика метода локтя
-plt.figure(figsize=(10, 6))
-plt.plot(K_range, inertia, 'bo-')
-plt.xlabel('Number of clusters (k)')
-plt.ylabel('Inertia')
-plt.title('Elbow Method for Optimal k')
-plt.grid(True)
-plt.savefig('elbow_method.png', dpi=300, bbox_inches='tight')
-plt.close()
 
 # Автоматическое определение оптимального k
 inertia_diff = np.diff(inertia)
@@ -170,6 +249,7 @@ def prepare_multivariate_lstm_data(segment_df, feature_columns, target_columns, 
 lstm_models = {}
 lstm_scalers_X = {}
 lstm_scalers_y = {}
+lstm_mape_results = {}  # Для хранения результатов MAPE
 
 # Выбираем признаки для LSTM (упрощенный набор)
 lstm_feature_columns = ['e1', 'e6', 'F', 'F1', 'F6']
@@ -229,7 +309,7 @@ for cluster_id in range(optimal_k):
     # Обучение модели
     history = model.fit(
         X_all, y_all,
-        epochs=100,
+        epochs=200,
         batch_size=16,
         validation_split=0.2,
         verbose=0
@@ -258,9 +338,9 @@ for cluster_id in range(optimal_k):
     plt.savefig(f'loss_cluster_{cluster_id}.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    # Прогноз на тестовых данных
+    # Прогноз на тестовых данных и расчет MAPE
     if len(X_all) > 10:
-        test_idx = min(10, len(X_all))
+        test_idx = min(20, len(X_all))
         X_test = X_all[:test_idx]
         y_true = y_all[:test_idx]
         
@@ -277,6 +357,22 @@ for cluster_id in range(optimal_k):
             y_true_original[:, target_idx] = y_scalers_list[0][target_idx].inverse_transform(
                 y_true[:, target_idx].reshape(-1, 1)
             ).flatten()
+        
+        # Расчет MAPE для каждой целевой переменной
+        mape_values = []
+        for target_idx in range(len(target_columns)):
+            true_vals = y_true_original[:, target_idx]
+            pred_vals = y_pred[:, target_idx]
+            
+            # Избегаем деления на ноль
+            mask = true_vals != 0
+            if np.any(mask):
+                mape = np.mean(np.abs((true_vals[mask] - pred_vals[mask]) / true_vals[mask])) * 100
+            else:
+                mape = np.mean(np.abs(pred_vals)) * 100
+            mape_values.append(mape)
+        
+        lstm_mape_results[cluster_id] = mape_values
         
         # Графики прогнозов для каждой целевой переменной
         for i, target_col in enumerate(target_columns):
@@ -314,7 +410,90 @@ for cluster_id in range(optimal_k):
     
     print(f"Модель для кластера {cluster_id} обучена и сохранена")
 
-# 7. Классификация нового временного ряда и прогнозирование
+# 7. Создание графика MAPE для всех кластеров и целевых переменных
+print("\n--- Создание графика MAPE ---")
+
+# Проверяем, есть ли данные для построения графика MAPE
+if lstm_mape_results:
+    plt.figure(figsize=(15, 8))
+    
+    # Подготовка данных для группированного столбчатого графика
+    cluster_ids = list(lstm_mape_results.keys())
+    x = np.arange(len(target_columns))
+    width = 0.8 / len(cluster_ids)
+    
+    colors = plt.cm.Set3(np.linspace(0, 1, len(cluster_ids)))
+    
+    for idx, cluster_id in enumerate(cluster_ids):
+        mape_values = lstm_mape_results[cluster_id]
+        plt.bar(x + idx * width - (len(cluster_ids) - 1) * width / 2, 
+                mape_values, width, label=f'Cluster {cluster_id}', color=colors[idx], alpha=0.8)
+        
+        # Добавление значений на столбцы
+        for j, value in enumerate(mape_values):
+            plt.text(x[j] + idx * width - (len(cluster_ids) - 1) * width / 2, 
+                    value + 1, f'{value:.1f}%', ha='center', va='bottom', fontsize=9)
+    
+    plt.xlabel('Target Variables', fontsize=12)
+    plt.ylabel('MAPE (%)', fontsize=12)
+    plt.title('Mean Absolute Percentage Error (MAPE) by Cluster and Target Variable', fontsize=14, pad=20)
+    plt.xticks(x, target_columns, rotation=45, ha='right')
+    plt.legend(title='Clusters', loc='upper right')
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.ylim(0, max([max(vals) for vals in lstm_mape_results.values()]) * 1.2 if any(lstm_mape_results.values()) else 50)
+    
+    # Добавляем горизонтальные линии для уровней качества прогноза
+    plt.axhline(y=10, color='green', linestyle='--', alpha=0.5, label='Excellent (<10%)')
+    plt.axhline(y=20, color='yellow', linestyle='--', alpha=0.5, label='Good (<20%)')
+    plt.axhline(y=30, color='orange', linestyle='--', alpha=0.5, label='Fair (<30%)')
+    plt.axhline(y=50, color='red', linestyle='--', alpha=0.5, label='Poor (<50%)')
+    
+    plt.tight_layout()
+    plt.savefig('mape_by_cluster_and_target.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print("График MAPE сохранен как 'mape_by_cluster_and_target.png'")
+    
+    # Дополнительный график: средний MAPE по кластерам
+    plt.figure(figsize=(12, 6))
+    
+    avg_mape_by_cluster = {}
+    for cluster_id, mape_values in lstm_mape_results.items():
+        avg_mape_by_cluster[cluster_id] = np.mean(mape_values)
+    
+    # Сортируем кластеры по среднему MAPE
+    sorted_clusters = sorted(avg_mape_by_cluster.items(), key=lambda x: x[1])
+    clusters_sorted = [c[0] for c in sorted_clusters]
+    avg_mape_sorted = [c[1] for c in sorted_clusters]
+    
+    bars = plt.bar(range(len(clusters_sorted)), avg_mape_sorted, 
+                   color=plt.cm.viridis(np.linspace(0, 0.8, len(clusters_sorted))))
+    
+    plt.xlabel('Cluster ID', fontsize=12)
+    plt.ylabel('Average MAPE (%)', fontsize=12)
+    plt.title('Average MAPE by Cluster', fontsize=14, pad=20)
+    plt.xticks(range(len(clusters_sorted)), [f'Cluster {c}' for c in clusters_sorted])
+    
+    # Добавляем значения на столбцы
+    for idx, value in enumerate(avg_mape_sorted):
+        plt.text(idx, value + 1, f'{value:.2f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # Цветовая градация по качеству прогноза
+    ax = plt.gca()
+    ax.axhspan(0, 10, alpha=0.2, color='green', label='Excellent')
+    ax.axhspan(10, 20, alpha=0.2, color='yellow', label='Good')
+    ax.axhspan(20, 30, alpha=0.2, color='orange', label='Fair')
+    ax.axhspan(30, 50, alpha=0.2, color='red', label='Poor')
+    
+    plt.grid(True, alpha=0.3, axis='y')
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+    plt.savefig('average_mape_by_cluster.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print("График среднего MAPE сохранен как 'average_mape_by_cluster.png'")
+
+# 8. Классификация нового временного ряда и прогнозирование
 def classify_and_predict(new_segment_df, features_df, kmeans_model, scaler, lstm_models, lstm_scalers_X, lstm_scalers_y, 
                          feature_columns, target_columns, sequence_length=10):
     """
@@ -366,114 +545,6 @@ def classify_and_predict(new_segment_df, features_df, kmeans_model, scaler, lstm
     
     return y_pred, X_data[-1], cluster_label
 
-# Пример использования для классификации и прогноза
-print("\n--- Пример классификации и прогноза для нового ряда ---")
-
-# Создаем тестовый сегмент (можно взять существующий)
-test_segment_idx = 5
-if test_segment_idx < len(segments):
-    new_segment = segments[test_segment_idx]
-    
-    prediction, last_values, cluster = classify_and_predict(
-        new_segment, 
-        features_df, 
-        kmeans, 
-        scaler, 
-        lstm_models, 
-        lstm_scalers_X,
-        lstm_scalers_y,
-        lstm_feature_columns,
-        target_columns
-    )
-    
-    if prediction is not None:
-        print(f"\nПрогнозируемые значения:")
-        for i, target_col in enumerate(target_columns):
-            print(f"  {target_col}: {prediction[i]:.6f}")
-        
-        # Визуализация прогнозов
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # График временного ряда
-        axes[0, 0].plot(new_segment['F'].values, label='F', marker='o', markersize=3)
-        axes[0, 0].axvline(x=len(new_segment)-10, color='r', linestyle='--', label='Prediction Window')
-        axes[0, 0].set_title(f'Time Series F (Cluster {cluster})')
-        axes[0, 0].set_xlabel('Time Step')
-        axes[0, 0].set_ylabel('Value')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True)
-        
-        # График прогнозов vs последние известные значения
-        x_pos = np.arange(len(target_columns))
-        width = 0.35
-        last_known = [new_segment[col].iloc[-1] for col in target_columns]
-        
-        axes[0, 1].bar(x_pos - width/2, last_known, width, label='Last Known', alpha=0.7)
-        axes[0, 1].bar(x_pos + width/2, prediction, width, label='Predicted', alpha=0.7)
-        axes[0, 1].set_xlabel('Target Variables')
-        axes[0, 1].set_ylabel('Value')
-        axes[0, 1].set_title(f'Predictions vs Last Known Values (Cluster {cluster})')
-        axes[0, 1].set_xticks(x_pos)
-        axes[0, 1].set_xticklabels(target_columns, rotation=45, ha='right')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, axis='y')
-        
-        # График относительной ошибки
-        errors = []
-        for i, col in enumerate(target_columns):
-            if last_known[i] != 0:
-                error = abs(prediction[i] - last_known[i]) / abs(last_known[i]) * 100
-            else:
-                error = abs(prediction[i]) * 100
-            errors.append(error)
-        
-        colors = ['green' if err < 20 else 'orange' if err < 50 else 'red' for err in errors]
-        axes[1, 0].bar(target_columns, errors, color=colors, alpha=0.7)
-        axes[1, 0].axhline(y=20, color='r', linestyle='--', label='20% threshold')
-        axes[1, 0].set_xlabel('Target Variables')
-        axes[1, 0].set_ylabel('Relative Error (%)')
-        axes[1, 0].set_title('Prediction Relative Error')
-        axes[1, 0].set_xticklabels(target_columns, rotation=45, ha='right')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, axis='y')
-        
-        # График нескольких целевых переменных
-        for i, col in enumerate(target_columns[:3]):
-            axes[1, 1].plot(new_segment[col].values, label=col, alpha=0.7)
-        axes[1, 1].set_title('Target Variables in Segment')
-        axes[1, 1].set_xlabel('Time Step')
-        axes[1, 1].set_ylabel('Value')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True)
-        
-        plt.suptitle(f'Prediction Results for Test Segment (Cluster {cluster})', fontsize=14, y=1.02)
-        plt.tight_layout()
-        plt.savefig('new_series_multivariate_prediction.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print("\nГрафик сохранен как 'new_series_multivariate_prediction.png'")
-
-# 8. Дополнительная визуализация характеристик кластеров
-plt.figure(figsize=(15, 10))
-key_features = ['F_mean', 'F_variance', 'F_trend', 'F1_mean']
-
-for i, feature in enumerate(key_features, 1):
-    if feature in features_df.columns:
-        plt.subplot(2, 2, i)
-        for cluster_id in range(optimal_k):
-            cluster_data = features_df[features_df['cluster'] == cluster_id][feature]
-            if len(cluster_data) > 0:
-                plt.hist(cluster_data, alpha=0.5, label=f'Cluster {cluster_id}', bins=10)
-        plt.title(f'Distribution of {feature} by Cluster')
-        plt.xlabel(feature)
-        plt.ylabel('Frequency')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.savefig('cluster_feature_distributions.png', dpi=300, bbox_inches='tight')
-plt.close()
-
 # 9. Сводный отчет по кластерам
 print("\n" + "="*60)
 print("СВОДНЫЙ ОТЧЕТ ПО КЛАСТЕРАМ")
@@ -497,7 +568,9 @@ report_data = {
         'Segment Length',
         'LSTM Sequence Length',
         'Target Variables',
-        'LSTM Models Trained'
+        'LSTM Models Trained',
+        'Data Smoothing Method',
+        'Smoothing Window Size'
     ],
     'Value': [
         len(segments),
@@ -505,7 +578,9 @@ report_data = {
         segment_length,
         10,
         len(target_columns),
-        len(lstm_models)
+        len(lstm_models),
+        'moving_average',
+        3
     ]
 }
 
@@ -514,11 +589,20 @@ for cluster_id in range(optimal_k):
     count = len(features_df[features_df['cluster'] == cluster_id])
     percentage = count/len(segments)*100 if len(segments) > 0 else 0
     has_model = 'Yes' if cluster_id in lstm_models else 'No'
+    
+    # Добавляем информацию о MAPE, если есть
+    if cluster_id in lstm_mape_results:
+        avg_mape = np.mean(lstm_mape_results[cluster_id])
+        mape_info = f"{avg_mape:.2f}%"
+    else:
+        mape_info = "N/A"
+    
     cluster_report.append({
         'Cluster ID': cluster_id,
         'Segments Count': count,
         'Percentage (%)': round(percentage, 1),
-        'LSTM Model': has_model
+        'LSTM Model': has_model,
+        'Avg MAPE': mape_info
     })
 
 report_df1 = pd.DataFrame(report_data)
@@ -529,6 +613,45 @@ with pd.ExcelWriter('analysis_report.xlsx') as writer:
     report_df2.to_excel(writer, sheet_name='Cluster Distribution', index=False)
     features_df.to_excel(writer, sheet_name='Segment Features', index=False)
 
+# 11. Сохранение результатов MAPE в отдельный Excel файл
+if lstm_mape_results:
+    mape_data = []
+    for cluster_id, mape_values in lstm_mape_results.items():
+        for i, target_col in enumerate(target_columns):
+            if i < len(mape_values):
+                mape_data.append({
+                    'Cluster': cluster_id,
+                    'Target Variable': target_col,
+                    'MAPE (%)': round(mape_values[i], 2)
+                })
+    
+    mape_df = pd.DataFrame(mape_data)
+    
+    # Добавляем сводную статистику
+    summary_stats = []
+    for cluster_id in lstm_mape_results.keys():
+        if cluster_id in lstm_mape_results:
+            mape_vals = lstm_mape_results[cluster_id]
+            summary_stats.append({
+                'Cluster': cluster_id,
+                'Min MAPE (%)': round(np.min(mape_vals), 2),
+                'Max MAPE (%)': round(np.max(mape_vals), 2),
+                'Avg MAPE (%)': round(np.mean(mape_vals), 2),
+                'Std MAPE (%)': round(np.std(mape_vals), 2)
+            })
+    
+    summary_df = pd.DataFrame(summary_stats)
+    
+    with pd.ExcelWriter('mape_results.xlsx') as writer:
+        mape_df.to_excel(writer, sheet_name='Detailed MAPE', index=False)
+        summary_df.to_excel(writer, sheet_name='Summary Statistics', index=False)
+    
+    print("\nРезультаты MAPE сохранены в 'mape_results.xlsx'")
+
+# 12. Сохранение сглаженных данных
+df_smoothed.to_excel('smoothed_dataset.xlsx', index=False)
+print("Сглаженные данные сохранены в 'smoothed_dataset.xlsx'")
+
 print("\n" + "="*60)
 print("СОЗДАННЫЕ ФАЙЛЫ")
 print("="*60)
@@ -537,12 +660,14 @@ files_categories = {
         "segmented_time_series.xlsx",
         "temporal_features.xlsx", 
         "temporal_features_with_clusters.xlsx",
-        "analysis_report.xlsx"
+        "analysis_report.xlsx",
+        "mape_results.xlsx",
+        "smoothed_dataset.xlsx"
     ],
     "Графики": [
-        "elbow_method.png",
-        "cluster_feature_distributions.png",
-        "new_series_multivariate_prediction.png"
+        "smoothing_comparison.png",
+        "mape_by_cluster_and_target.png",
+        "average_mape_by_cluster.png"
     ],
     "Модели LSTM": [f"lstm_model_cluster_{cluster_id}.keras" for cluster_id in lstm_models.keys()],
     "Графики обучения": []
